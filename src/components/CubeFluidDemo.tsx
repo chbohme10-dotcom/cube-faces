@@ -1,8 +1,9 @@
 import { useRef, useMemo, useCallback } from "react";
-import { Canvas, useFrame } from "@react-three/fiber";
+import { Canvas, useFrame, useThree, ThreeEvent } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
 import { FluidSolver } from "@/lib/fluidSolver";
+import { createOceanSpectrum, evaluateGerstnerHeight, GerstnerWaveComponent } from "@/lib/gerstnerWaves";
 
 const N = 48;
 const DIFFUSION = 0.00001;
@@ -10,18 +11,17 @@ const VISCOSITY = 0.000001;
 const DEPTH_DECAY_WAVE = 4.0;
 const DEPTH_DECAY_VORTEX = 2.0;
 const PROXIMITY_RATE = 3.0;
+const CUBE_SIZE = 2.8;
 
 const TOP_COLOR = [30, 120, 255] as const;
 const BOTTOM_COLOR = [20, 30, 100] as const;
 const SIDE_COLORS: readonly (readonly [number, number, number])[] = [
-  [0, 180, 230],   // +X right
-  [0, 160, 210],   // -X left
-  [0, 200, 190],   // +Z front
-  [100, 80, 240],  // -Z back
+  [0, 180, 230],
+  [0, 160, 210],
+  [0, 200, 190],
+  [100, 80, 240],
 ];
 
-// Side face config: [materialIndex, proximityIndex, integrateAxis]
-// integrateAxis: 0 = integrate over x (side faces ±X), 1 = integrate over z (side faces ±Z)
 const SIDE_CONFIGS: [number, number, number, readonly [number, number, number]][] = [
   [0, 0, 0, SIDE_COLORS[0]], // +X right
   [1, 1, 0, SIDE_COLORS[1]], // -X left
@@ -31,7 +31,6 @@ const SIDE_CONFIGS: [number, number, number, readonly [number, number, number]][
 
 /**
  * 2D wave equation solver for the top face.
- * Produces real circular wave propagation with interference patterns.
  */
 class WaveField {
   N: number;
@@ -67,7 +66,6 @@ class WaveField {
     }
   }
 
-  /** Add a ring-shaped wave (like a pebble drop) */
   addRingWave(cx: number, cy: number, radius: number, width: number, strength: number) {
     const N = this.N;
     const outer = Math.ceil(radius + width);
@@ -102,7 +100,6 @@ class WaveField {
       }
     }
 
-    // Absorbing boundary
     for (let k = 1; k <= N; k++) {
       this.hTemp[this.IX(0, k)] = this.hTemp[this.IX(1, k)] * 0.7;
       this.hTemp[this.IX(N + 1, k)] = this.hTemp[this.IX(N, k)] * 0.7;
@@ -110,7 +107,6 @@ class WaveField {
       this.hTemp[this.IX(k, N + 1)] = this.hTemp[this.IX(k, N)] * 0.7;
     }
 
-    // Rotate buffers
     const tmp = this.hPrev;
     this.hPrev = this.h;
     this.h = this.hTemp;
@@ -124,10 +120,12 @@ function FluidCube() {
   const meshRef = useRef<THREE.Mesh>(null);
   const frameRef = useRef(0);
   const timeRef = useRef(0);
+  const { raycaster, camera } = useThree();
 
   const ctx = useMemo(() => {
     const waveField = new WaveField(N);
     const solver = new FluidSolver(N);
+    const gerstnerWaves = createOceanSpectrum(N);
 
     const textures = Array.from({ length: 6 }, () => {
       const data = new Uint8Array(N * N * 4);
@@ -141,19 +139,16 @@ function FluidCube() {
 
     const materials = textures.map(tex => new THREE.MeshBasicMaterial({ map: tex }));
 
-    // Proximity weights: how strongly a given x or z position contributes to each side face
     const proximityWeights = Array.from({ length: 4 }, () => new Float32Array(N));
-    let proxSum = 0;
     for (let k = 0; k < N; k++) {
       const pos = k + 1;
-      proximityWeights[0][k] = Math.exp(-PROXIMITY_RATE * (N - pos) / N); // +X: high x = strong
-      proximityWeights[1][k] = Math.exp(-PROXIMITY_RATE * (pos - 1) / N); // -X: low x = strong
-      proximityWeights[2][k] = Math.exp(-PROXIMITY_RATE * (N - pos) / N); // +Z: high z = strong
-      proximityWeights[3][k] = Math.exp(-PROXIMITY_RATE * (pos - 1) / N); // -Z: low z = strong
+      proximityWeights[0][k] = Math.exp(-PROXIMITY_RATE * (N - pos) / N);
+      proximityWeights[1][k] = Math.exp(-PROXIMITY_RATE * (pos - 1) / N);
+      proximityWeights[2][k] = Math.exp(-PROXIMITY_RATE * (N - pos) / N);
+      proximityWeights[3][k] = Math.exp(-PROXIMITY_RATE * (pos - 1) / N);
     }
-    proxSum = proximityWeights[0].reduce((a, b) => a + b, 0);
+    const proxSum = proximityWeights[0].reduce((a, b) => a + b, 0);
 
-    // Depth decay lookup tables
     const depthDecayW = new Float32Array(N);
     const depthDecayV = new Float32Array(N);
     for (let d = 0; d < N; d++) {
@@ -161,11 +156,17 @@ function FluidCube() {
       depthDecayV[d] = Math.exp(-DEPTH_DECAY_VORTEX * d / N);
     }
 
-    // Pre-allocated projection buffers
     const topWave = new Float32Array(N * N);
     const topVortex = new Float32Array(N * N);
 
-    return { waveField, solver, textures, materials, proximityWeights, proxSum, depthDecayW, depthDecayV, topWave, topVortex };
+    // Pending click impulses from raycasting
+    const pendingImpulses: { x: number; y: number; strength: number }[] = [];
+
+    return {
+      waveField, solver, gerstnerWaves, textures, materials,
+      proximityWeights, proxSum, depthDecayW, depthDecayV,
+      topWave, topVortex, pendingImpulses,
+    };
   }, []);
 
   const setMesh = useCallback((mesh: THREE.Mesh | null) => {
@@ -175,51 +176,89 @@ function FluidCube() {
     }
   }, [ctx.materials]);
 
+  /**
+   * Handle click/touch on the cube — raycast to find top face hit point
+   * and inject a wave impulse at that location.
+   */
+  const handlePointerDown = useCallback((event: ThreeEvent<PointerEvent>) => {
+    event.stopPropagation();
+    const mesh = meshRef.current;
+    if (!mesh || !event.face) return;
+
+    // Check if we hit the top face (+Y). The face normal should point up.
+    const normal = event.face.normal;
+    if (normal.y < 0.5) return; // Not the top face
+
+    // Convert hit point to local cube coordinates
+    const localPoint = mesh.worldToLocal(event.point.clone());
+
+    // Map from cube local coords [-1.4, 1.4] to grid coords [1, N]
+    const halfSize = CUBE_SIZE / 2;
+    const gx = Math.round(((localPoint.x + halfSize) / CUBE_SIZE) * (N - 1) + 1);
+    const gz = Math.round(((localPoint.z + halfSize) / CUBE_SIZE) * (N - 1) + 1);
+
+    if (gx >= 1 && gx <= N && gz >= 1 && gz <= N) {
+      // Queue impulse + ring wave for natural water drop effect
+      ctx.pendingImpulses.push({ x: gx, y: gz, strength: 120 });
+
+      // Also inject vorticity at the click point for swirling effect
+      const r = 5;
+      const str = 80;
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist > 0.5 && dist <= r) {
+            const xi = gx + dx, yi = gz + dy;
+            if (xi >= 1 && xi <= N && yi >= 1 && yi <= N) {
+              const falloff = 1 - dist / r;
+              ctx.solver.addVelocity(xi, yi, -dy / dist * str * falloff, dx / dist * str * falloff);
+              ctx.solver.addDensity(xi, yi, str * falloff * 0.3);
+            }
+          }
+        }
+      }
+    }
+  }, [ctx]);
+
   useFrame((_, delta) => {
     const dt = Math.min(delta, 0.016);
     frameRef.current++;
     timeRef.current += dt;
     const time = timeRef.current;
     const frame = frameRef.current;
-    const { waveField, solver, textures, proximityWeights, proxSum, depthDecayW, depthDecayV, topWave, topVortex } = ctx;
+    const {
+      waveField, solver, gerstnerWaves, textures,
+      proximityWeights, proxSum, depthDecayW, depthDecayV,
+      topWave, topVortex, pendingImpulses,
+    } = ctx;
 
-    // ─── Wave sources: deterministic, physically motivated ───
+    // ─── Process pending click impulses ───
+    while (pendingImpulses.length > 0) {
+      const imp = pendingImpulses.pop()!;
+      waveField.addImpulse(imp.x, imp.y, 5, imp.strength);
+      waveField.addRingWave(imp.x, imp.y, 3, 2, imp.strength * 0.6);
+    }
 
-    // Primary orbiting dropper — creates expanding circular waves
-    if (frame % 35 === 0) {
+    // ─── Autonomous wave sources ───
+    if (frame % 50 === 0) {
       const cx = Math.floor(N / 2 + Math.cos(time * 0.4) * N * 0.28);
       const cy = Math.floor(N / 2 + Math.sin(time * 0.4) * N * 0.28);
-      waveField.addImpulse(cx, cy, 3, 70);
+      waveField.addImpulse(cx, cy, 3, 50);
     }
 
-    // Secondary dropper — counter-orbit for interference
-    if (frame % 35 === 17) {
+    if (frame % 50 === 25) {
       const cx = Math.floor(N / 2 + Math.cos(time * 0.6 + Math.PI) * N * 0.22);
       const cy = Math.floor(N / 2 + Math.sin(time * 0.6 + Math.PI) * N * 0.22);
-      waveField.addImpulse(cx, cy, 2, 50);
+      waveField.addImpulse(cx, cy, 2, 35);
     }
 
-    // Ring wave — pebble drop expanding outward
-    if (frame % 90 === 0) {
+    if (frame % 120 === 0) {
       const cx = Math.floor(N * 0.3 + Math.sin(time * 0.2) * N * 0.2);
       const cy = Math.floor(N * 0.3 + Math.cos(time * 0.3) * N * 0.2);
-      waveField.addRingWave(cx, cy, 2, 2, 40);
+      waveField.addRingWave(cx, cy, 2, 2, 30);
     }
 
-    // Edge-proximity wave — demonstrates face projection asymmetry
-    if (frame % 70 === 0) {
-      const side = Math.floor(time * 0.15) % 4;
-      let cx: number, cy: number;
-      switch (side) {
-        case 0: cx = N - 3; cy = N / 2; break;
-        case 1: cx = 4; cy = N / 2; break;
-        case 2: cx = N / 2; cy = N - 3; break;
-        default: cx = N / 2; cy = 4; break;
-      }
-      waveField.addImpulse(Math.floor(cx), Math.floor(cy), 4, 90);
-    }
-
-    // Vortex injection into fluid solver — swirling motion
+    // Vortex injection
     if (frame % 100 === 0) {
       const cx = Math.floor(N * 0.3 + Math.sin(time * 0.25) * N * 0.3);
       const cy = Math.floor(N * 0.3 + Math.cos(time * 0.25) * N * 0.3);
@@ -244,14 +283,15 @@ function FluidCube() {
     waveField.step(dt);
     solver.step(dt, DIFFUSION, VISCOSITY);
 
-    // ─── Build top-face energy fields for projection ───
+    // ─── Build top-face energy fields with Gerstner waves ───
     for (let j = 0; j < N; j++) {
       for (let i = 0; i < N; i++) {
         const gi = i + 1, gj = j + 1;
-        // Background ocean swell (rendering-only, doesn't affect simulation)
-        const swell = Math.sin(time * 1.2 + gi * 0.13 + gj * 0.09) * 1.5
-          + Math.sin(time * 0.7 + gi * 0.08 - gj * 0.12) * 1.0;
-        const h = waveField.getHeight(gi, gj) + swell;
+
+        // Gerstner wave evaluation — replaces the simple sine swell
+        const gerstnerH = evaluateGerstnerHeight(gi, gj, time, gerstnerWaves);
+
+        const h = waveField.getHeight(gi, gj) + gerstnerH;
         topWave[j * N + i] = Math.abs(h);
 
         const vx = solver.getVxAt(gi, gj);
@@ -266,16 +306,15 @@ function FluidCube() {
       for (let j = 0; j < N; j++) {
         for (let i = 0; i < N; i++) {
           const gi = i + 1, gj = j + 1;
-          const swell = Math.sin(time * 1.2 + gi * 0.13 + gj * 0.09) * 1.5
-            + Math.sin(time * 0.7 + gi * 0.08 - gj * 0.12) * 1.0;
-          const h = waveField.getHeight(gi, gj) + swell;
+          const gerstnerH = evaluateGerstnerHeight(gi, gj, time, gerstnerWaves);
+          const h = waveField.getHeight(gi, gj) + gerstnerH;
           const d = solver.getDensityAt(gi, gj);
           const vx = solver.getVxAt(gi, gj);
           const vy = solver.getVyAt(gi, gj);
           const vel = Math.sqrt(vx * vx + vy * vy);
 
-          const hNorm = h * 0.012;
-          const bright = Math.max(0, Math.min(1, 0.12 + hNorm * 0.4 + Math.abs(hNorm) * 0.45));
+          const hNorm = h * 0.008;
+          const bright = Math.max(0, Math.min(1, 0.15 + hNorm * 0.35 + Math.abs(hNorm) * 0.4));
           const swirl = Math.min(1, d * 0.008 + vel * 0.04);
 
           const idx = (j * N + i) * 4;
@@ -288,7 +327,7 @@ function FluidCube() {
       textures[2].needsUpdate = true;
     }
 
-    // ─── Render side faces — orthographic depth projection ───
+    // ─── Render side faces ───
     const invProxSum = 1.0 / proxSum;
 
     for (const [matIdx, proxIdx, intAxis, color] of SIDE_CONFIGS) {
@@ -296,7 +335,7 @@ function FluidCube() {
       const proxW = proximityWeights[proxIdx];
 
       for (let tj = 0; tj < N; tj++) {
-        const depth = N - 1 - tj; // tj=N-1 → top (depth 0), tj=0 → bottom (depth N-1)
+        const depth = N - 1 - tj;
         const wDecay = depthDecayW[depth];
         const vDecay = depthDecayV[depth];
 
@@ -305,7 +344,6 @@ function FluidCube() {
           let vortexVal = 0;
 
           if (intAxis === 0) {
-            // Integrate over x, ti maps to z-axis of top face
             const z = ti;
             for (let x = 0; x < N; x++) {
               const w = proxW[x];
@@ -313,7 +351,6 @@ function FluidCube() {
               vortexVal += topVortex[z * N + x] * w;
             }
           } else {
-            // Integrate over z, ti maps to x-axis of top face
             const x = ti;
             for (let z = 0; z < N; z++) {
               const w = proxW[z];
@@ -327,7 +364,7 @@ function FluidCube() {
 
           const val = waveVal * wDecay + vortexVal * vDecay;
           const t = Math.min(1, val * 0.018);
-          const t2 = t * t; // quadratic for more contrast
+          const t2 = t * t;
 
           const idx = (tj * N + ti) * 4;
           data[idx] = Math.floor(3 + t2 * color[0]);
@@ -339,7 +376,7 @@ function FluidCube() {
       textures[matIdx].needsUpdate = true;
     }
 
-    // ─── Render bottom face (material 3, -Y) — full-depth attenuation ───
+    // ─── Render bottom face (material 3, -Y) ───
     {
       const data = textures[3].image.data as Uint8Array;
       const wFull = depthDecayW[N - 1];
@@ -363,8 +400,8 @@ function FluidCube() {
   });
 
   return (
-    <mesh ref={setMesh}>
-      <boxGeometry args={[2.8, 2.8, 2.8]} />
+    <mesh ref={setMesh} onPointerDown={handlePointerDown}>
+      <boxGeometry args={[CUBE_SIZE, CUBE_SIZE, CUBE_SIZE]} />
     </mesh>
   );
 }
