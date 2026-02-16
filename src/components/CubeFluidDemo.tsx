@@ -3,25 +3,27 @@ import { Canvas, useFrame, useThree, ThreeEvent } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
 import { FluidSolver } from "@/lib/fluidSolver";
-import { createOceanSpectrum, evaluateGerstnerHeight, GerstnerWaveComponent } from "@/lib/gerstnerWaves";
+import { createOceanSpectrum, evaluateGerstnerHeight } from "@/lib/gerstnerWaves";
+import { VolumetricSlab, SlabCoupler, SLAB_DEPTH } from "@/lib/volumetricSlab";
 
+// ─── Constants ───
 const N = 48;
+const D = SLAB_DEPTH; // Slab depth layers
 const DIFFUSION = 0.00001;
 const VISCOSITY = 0.000001;
-const DEPTH_DECAY_WAVE = 4.0;
-const DEPTH_DECAY_VORTEX = 2.0;
-const PROXIMITY_RATE = 3.0;
 const CUBE_SIZE = 2.8;
 
+// Color palettes — deep ocean tones
 const TOP_COLOR = [30, 120, 255] as const;
-const BOTTOM_COLOR = [20, 30, 100] as const;
+const BOTTOM_COLOR = [8, 15, 55] as const;
 const SIDE_COLORS: readonly (readonly [number, number, number])[] = [
-  [0, 180, 230],
-  [0, 160, 210],
-  [0, 200, 190],
-  [100, 80, 240],
+  [15, 140, 220],  // +X
+  [10, 120, 200],  // -X  
+  [20, 160, 180],  // +Z
+  [60, 50, 200],   // -Z
 ];
 
+// Side config: [materialIndex, sideIndex, integrationAxis, color]
 const SIDE_CONFIGS: [number, number, number, readonly [number, number, number]][] = [
   [0, 0, 0, SIDE_COLORS[0]], // +X right
   [1, 1, 0, SIDE_COLORS[1]], // -X left
@@ -29,9 +31,7 @@ const SIDE_CONFIGS: [number, number, number, readonly [number, number, number]][
   [5, 3, 1, SIDE_COLORS[3]], // -Z back
 ];
 
-/**
- * 2D wave equation solver for the top face.
- */
+// ─── WaveField: 2D wave equation for top face ───
 class WaveField {
   N: number;
   size: number;
@@ -84,13 +84,22 @@ class WaveField {
     }
   }
 
+  /** Apply pressure feedback from volumetric interior (upwelling) */
+  applyPressureFeedback(pressureField: Float32Array, strength: number) {
+    const N = this.N;
+    for (let j = 1; j <= N; j++) {
+      for (let i = 1; i <= N; i++) {
+        this.h[this.IX(i, j)] += pressureField[(j - 1) * N + (i - 1)] * strength;
+      }
+    }
+  }
+
   step(dt: number) {
     const N = this.N;
     const c2 = 0.15 * N * N * dt * dt;
     const damp = 0.997;
 
     this.hTemp.fill(0);
-
     for (let j = 1; j <= N; j++) {
       for (let i = 1; i <= N; i++) {
         const idx = this.IX(i, j);
@@ -100,6 +109,7 @@ class WaveField {
       }
     }
 
+    // Reflective boundaries with damping
     for (let k = 1; k <= N; k++) {
       this.hTemp[this.IX(0, k)] = this.hTemp[this.IX(1, k)] * 0.7;
       this.hTemp[this.IX(N + 1, k)] = this.hTemp[this.IX(N, k)] * 0.7;
@@ -116,17 +126,22 @@ class WaveField {
   getHeight(i: number, j: number) { return this.h[this.IX(i, j)]; }
 }
 
+// ─── Main Scene Component ───
 function FluidCube() {
   const meshRef = useRef<THREE.Mesh>(null);
   const frameRef = useRef(0);
   const timeRef = useRef(0);
-  const { raycaster, camera } = useThree();
 
   const ctx = useMemo(() => {
     const waveField = new WaveField(N);
     const solver = new FluidSolver(N);
     const gerstnerWaves = createOceanSpectrum(N);
 
+    // Volumetric slabs — one per side face (4 sides)
+    const slabs = Array.from({ length: 4 }, () => new VolumetricSlab(N, D));
+    const coupler = new SlabCoupler(N, D);
+
+    // Textures & materials for the 6 cube faces
     const textures = Array.from({ length: 6 }, () => {
       const data = new Uint8Array(N * N * 4);
       for (let k = 3; k < data.length; k += 4) data[k] = 255;
@@ -136,36 +151,21 @@ function FluidCube() {
       tex.needsUpdate = true;
       return tex;
     });
-
     const materials = textures.map(tex => new THREE.MeshBasicMaterial({ map: tex }));
 
-    const proximityWeights = Array.from({ length: 4 }, () => new Float32Array(N));
-    for (let k = 0; k < N; k++) {
-      const pos = k + 1;
-      proximityWeights[0][k] = Math.exp(-PROXIMITY_RATE * (N - pos) / N);
-      proximityWeights[1][k] = Math.exp(-PROXIMITY_RATE * (pos - 1) / N);
-      proximityWeights[2][k] = Math.exp(-PROXIMITY_RATE * (N - pos) / N);
-      proximityWeights[3][k] = Math.exp(-PROXIMITY_RATE * (pos - 1) / N);
-    }
-    const proxSum = proximityWeights[0].reduce((a, b) => a + b, 0);
+    // Scratch buffers for surface injection
+    const surfaceVelocity = new Float32Array(N * N);
+    const surfaceVorticity = new Float32Array(N * N);
+    const surfacePressure = new Float32Array(N * N); // Feedback from slabs
 
-    const depthDecayW = new Float32Array(N);
-    const depthDecayV = new Float32Array(N);
-    for (let d = 0; d < N; d++) {
-      depthDecayW[d] = Math.exp(-DEPTH_DECAY_WAVE * d / N);
-      depthDecayV[d] = Math.exp(-DEPTH_DECAY_VORTEX * d / N);
-    }
-
-    const topWave = new Float32Array(N * N);
-    const topVortex = new Float32Array(N * N);
-
-    // Pending click impulses from raycasting
+    // Pending click impulses
     const pendingImpulses: { x: number; y: number; strength: number }[] = [];
 
     return {
-      waveField, solver, gerstnerWaves, textures, materials,
-      proximityWeights, proxSum, depthDecayW, depthDecayV,
-      topWave, topVortex, pendingImpulses,
+      waveField, solver, gerstnerWaves, slabs, coupler,
+      textures, materials,
+      surfaceVelocity, surfaceVorticity, surfacePressure,
+      pendingImpulses,
     };
   }, []);
 
@@ -176,34 +176,25 @@ function FluidCube() {
     }
   }, [ctx.materials]);
 
-  /**
-   * Handle click/touch on the cube — raycast to find top face hit point
-   * and inject a wave impulse at that location.
-   */
+  // ─── Click interaction: raycast to top face ───
   const handlePointerDown = useCallback((event: ThreeEvent<PointerEvent>) => {
     event.stopPropagation();
     const mesh = meshRef.current;
     if (!mesh || !event.face) return;
 
-    // Check if we hit the top face (+Y). The face normal should point up.
-    const normal = event.face.normal;
-    if (normal.y < 0.5) return; // Not the top face
+    if (event.face.normal.y < 0.5) return; // Not top face
 
-    // Convert hit point to local cube coordinates
     const localPoint = mesh.worldToLocal(event.point.clone());
-
-    // Map from cube local coords [-1.4, 1.4] to grid coords [1, N]
     const halfSize = CUBE_SIZE / 2;
     const gx = Math.round(((localPoint.x + halfSize) / CUBE_SIZE) * (N - 1) + 1);
     const gz = Math.round(((localPoint.z + halfSize) / CUBE_SIZE) * (N - 1) + 1);
 
     if (gx >= 1 && gx <= N && gz >= 1 && gz <= N) {
-      // Queue impulse + ring wave for natural water drop effect
-      ctx.pendingImpulses.push({ x: gx, y: gz, strength: 120 });
+      ctx.pendingImpulses.push({ x: gx, y: gz, strength: 150 });
 
-      // Also inject vorticity at the click point for swirling effect
-      const r = 5;
-      const str = 80;
+      // Inject strong vortex at click point
+      const r = 6;
+      const str = 100;
       for (let dy = -r; dy <= r; dy++) {
         for (let dx = -r; dx <= r; dx++) {
           const dist = Math.sqrt(dx * dx + dy * dy);
@@ -212,7 +203,7 @@ function FluidCube() {
             if (xi >= 1 && xi <= N && yi >= 1 && yi <= N) {
               const falloff = 1 - dist / r;
               ctx.solver.addVelocity(xi, yi, -dy / dist * str * falloff, dx / dist * str * falloff);
-              ctx.solver.addDensity(xi, yi, str * falloff * 0.3);
+              ctx.solver.addDensity(xi, yi, str * falloff * 0.4);
             }
           }
         }
@@ -227,43 +218,40 @@ function FluidCube() {
     const time = timeRef.current;
     const frame = frameRef.current;
     const {
-      waveField, solver, gerstnerWaves, textures,
-      proximityWeights, proxSum, depthDecayW, depthDecayV,
-      topWave, topVortex, pendingImpulses,
+      waveField, solver, gerstnerWaves, slabs, coupler,
+      textures, surfaceVelocity, surfaceVorticity, surfacePressure,
+      pendingImpulses,
     } = ctx;
 
-    // ─── Process pending click impulses ───
+    // ─── 1. Process click impulses ───
     while (pendingImpulses.length > 0) {
       const imp = pendingImpulses.pop()!;
       waveField.addImpulse(imp.x, imp.y, 5, imp.strength);
-      waveField.addRingWave(imp.x, imp.y, 3, 2, imp.strength * 0.6);
+      waveField.addRingWave(imp.x, imp.y, 4, 2.5, imp.strength * 0.7);
     }
 
-    // ─── Autonomous wave sources ───
+    // ─── 2. Autonomous wave sources ───
     if (frame % 50 === 0) {
       const cx = Math.floor(N / 2 + Math.cos(time * 0.4) * N * 0.28);
       const cy = Math.floor(N / 2 + Math.sin(time * 0.4) * N * 0.28);
       waveField.addImpulse(cx, cy, 3, 50);
     }
-
     if (frame % 50 === 25) {
       const cx = Math.floor(N / 2 + Math.cos(time * 0.6 + Math.PI) * N * 0.22);
       const cy = Math.floor(N / 2 + Math.sin(time * 0.6 + Math.PI) * N * 0.22);
       waveField.addImpulse(cx, cy, 2, 35);
     }
-
     if (frame % 120 === 0) {
       const cx = Math.floor(N * 0.3 + Math.sin(time * 0.2) * N * 0.2);
       const cy = Math.floor(N * 0.3 + Math.cos(time * 0.3) * N * 0.2);
-      waveField.addRingWave(cx, cy, 2, 2, 30);
+      waveField.addRingWave(cx, cy, 3, 2, 30);
     }
 
-    // Vortex injection
+    // Autonomous vortex injection
     if (frame % 100 === 0) {
       const cx = Math.floor(N * 0.3 + Math.sin(time * 0.25) * N * 0.3);
       const cy = Math.floor(N * 0.3 + Math.cos(time * 0.25) * N * 0.3);
-      const r = 6;
-      const str = 60;
+      const r = 6, str = 60;
       for (let dy = -r; dy <= r; dy++) {
         for (let dx = -r; dx <= r; dx++) {
           const dist = Math.sqrt(dx * dx + dy * dy);
@@ -279,28 +267,102 @@ function FluidCube() {
       }
     }
 
-    // ─── Step simulations ───
+    // ─── 3. Apply volumetric pressure feedback to surface ───
+    // Upwelling from the interior volume drives the surface waves
+    surfacePressure.fill(0);
+    for (let s = 0; s < 4; s++) {
+      for (let j = 0; j < N; j++) {
+        for (let i = 0; i < N; i++) {
+          surfacePressure[j * N + i] += slabs[s].getSurfacePressure(i, j) * 0.25;
+        }
+      }
+    }
+    waveField.applyPressureFeedback(surfacePressure, dt * 0.8);
+
+    // ─── 4. Step physics ───
     waveField.step(dt);
     solver.step(dt, DIFFUSION, VISCOSITY);
 
-    // ─── Build top-face energy fields with Gerstner waves ───
+    // ─── 5. Build surface energy fields ───
     for (let j = 0; j < N; j++) {
       for (let i = 0; i < N; i++) {
         const gi = i + 1, gj = j + 1;
-
-        // Gerstner wave evaluation — replaces the simple sine swell
         const gerstnerH = evaluateGerstnerHeight(gi, gj, time, gerstnerWaves);
-
         const h = waveField.getHeight(gi, gj) + gerstnerH;
-        topWave[j * N + i] = Math.abs(h);
 
         const vx = solver.getVxAt(gi, gj);
         const vy = solver.getVyAt(gi, gj);
-        topVortex[j * N + i] = solver.getDensityAt(gi, gj) * 0.4 + Math.sqrt(vx * vx + vy * vy) * 0.35;
+        const vel = Math.sqrt(vx * vx + vy * vy);
+        const vort = solver.getDensityAt(gi, gj);
+
+        const idx = j * N + i;
+        // Perpendicular velocity = wave height gradient (approximation)
+        surfaceVelocity[idx] = Math.abs(h) * 0.5 + vel * 0.3;
+        // Vorticity = density + velocity curl
+        surfaceVorticity[idx] = vort * 0.5 + vel * 0.4;
       }
     }
 
-    // ─── Render top face (material 2, +Y) ───
+    // ─── 6. Inject surface energy into volumetric slabs ───
+    // Each slab gets the full surface but weighted by proximity to its face
+    for (let s = 0; s < 4; s++) {
+      const slab = slabs[s];
+      const cfg = SIDE_CONFIGS[s];
+      const intAxis = cfg[2]; // 0 = integrates along X, 1 = integrates along Z
+
+      // Build proximity-weighted surface for this face
+      for (let j = 0; j < N; j++) {
+        for (let i = 0; i < N; i++) {
+          const idx = j * N + i;
+          // Proximity weight: how close is this point to the face edge?
+          let proxWeight: number;
+          if (s === 0) { // +X: strong when i is high
+            proxWeight = Math.exp(-3.0 * (1 - i / N));
+          } else if (s === 1) { // -X: strong when i is low  
+            proxWeight = Math.exp(-3.0 * (i / N));
+          } else if (s === 2) { // +Z: strong when j is high
+            proxWeight = Math.exp(-3.0 * (1 - j / N));
+          } else { // -Z: strong when j is low
+            proxWeight = Math.exp(-3.0 * (j / N));
+          }
+
+          surfaceVelocity[idx] *= proxWeight;
+          surfaceVorticity[idx] *= proxWeight;
+        }
+      }
+
+      slab.injectSurface(surfaceVelocity, surfaceVorticity);
+
+      // Restore unweighted values for next slab
+      for (let j = 0; j < N; j++) {
+        for (let i = 0; i < N; i++) {
+          const gi = i + 1, gj = j + 1;
+          const gerstnerH = evaluateGerstnerHeight(gi, gj, time, gerstnerWaves);
+          const h = waveField.getHeight(gi, gj) + gerstnerH;
+          const vx = solver.getVxAt(gi, gj);
+          const vy = solver.getVyAt(gi, gj);
+          const vel = Math.sqrt(vx * vx + vy * vy);
+          const vort = solver.getDensityAt(gi, gj);
+          const idx = j * N + i;
+          surfaceVelocity[idx] = Math.abs(h) * 0.5 + vel * 0.3;
+          surfaceVorticity[idx] = vort * 0.5 + vel * 0.4;
+        }
+      }
+    }
+
+    // ─── 7. Step volumetric slabs ───
+    for (let s = 0; s < 4; s++) {
+      slabs[s].step(dt, 0.02);
+    }
+
+    // ─── 8. Couple adjacent slabs (hypergraph interaction) ───
+    // Adjacent side slabs share edges where their volumetric extrusions overlap
+    coupler.coupleSlabs(slabs[0], slabs[2], 0.1); // +X ↔ +Z
+    coupler.coupleSlabs(slabs[0], slabs[3], 0.1); // +X ↔ -Z
+    coupler.coupleSlabs(slabs[1], slabs[2], 0.1); // -X ↔ +Z
+    coupler.coupleSlabs(slabs[1], slabs[3], 0.1); // -X ↔ -Z
+
+    // ─── 9. Render top face ───
     {
       const data = textures[2].image.data as Uint8Array;
       for (let j = 0; j < N; j++) {
@@ -313,85 +375,125 @@ function FluidCube() {
           const vy = solver.getVyAt(gi, gj);
           const vel = Math.sqrt(vx * vx + vy * vy);
 
+          // Height-based lighting with Fresnel-like effect
           const hNorm = h * 0.008;
           const bright = Math.max(0, Math.min(1, 0.15 + hNorm * 0.35 + Math.abs(hNorm) * 0.4));
           const swirl = Math.min(1, d * 0.008 + vel * 0.04);
 
+          // Caustic shimmer from volumetric pressure feedback
+          const pFeedback = surfacePressure[j * N + i] * 0.02;
+          const caustic = Math.max(0, Math.sin(h * 3 + time * 2) * 0.15 + pFeedback);
+
           const idx = (j * N + i) * 4;
-          data[idx] = Math.floor(Math.min(255, bright * TOP_COLOR[0] + swirl * 50));
-          data[idx + 1] = Math.floor(Math.min(255, bright * TOP_COLOR[1] + swirl * 70));
-          data[idx + 2] = Math.floor(Math.min(255, bright * TOP_COLOR[2] + swirl * 30));
+          data[idx]     = Math.floor(Math.min(255, bright * TOP_COLOR[0] + swirl * 50 + caustic * 40));
+          data[idx + 1] = Math.floor(Math.min(255, bright * TOP_COLOR[1] + swirl * 70 + caustic * 80));
+          data[idx + 2] = Math.floor(Math.min(255, bright * TOP_COLOR[2] + swirl * 30 + caustic * 20));
           data[idx + 3] = 255;
         }
       }
       textures[2].needsUpdate = true;
     }
 
-    // ─── Render side faces ───
-    const invProxSum = 1.0 / proxSum;
-
-    for (const [matIdx, proxIdx, intAxis, color] of SIDE_CONFIGS) {
+    // ─── 10. Render side faces from volumetric slabs ───
+    for (let si = 0; si < 4; si++) {
+      const [matIdx, , intAxis, color] = SIDE_CONFIGS[si];
+      const slab = slabs[si];
       const data = textures[matIdx].image.data as Uint8Array;
-      const proxW = proximityWeights[proxIdx];
 
       for (let tj = 0; tj < N; tj++) {
-        const depth = N - 1 - tj;
-        const wDecay = depthDecayW[depth];
-        const vDecay = depthDecayV[depth];
+        // Map vertical pixel to depth layer
+        const depthFrac = tj / N; // 0 = top, 1 = bottom
+        const kFloat = depthFrac * (D - 1);
+        const k0 = Math.floor(kFloat);
+        const k1 = Math.min(D - 1, k0 + 1);
+        const kFrac = kFloat - k0;
 
         for (let ti = 0; ti < N; ti++) {
-          let waveVal = 0;
-          let vortexVal = 0;
+          // Sample the volumetric slab with interpolation
+          const [vort0, perp0, pres0] = slab.sample(ti, ti, k0);
+          const [vort1, perp1, pres1] = slab.sample(ti, ti, k1);
 
+          const vort = vort0 * (1 - kFrac) + vort1 * kFrac;
+          const perp = perp0 * (1 - kFrac) + perp1 * kFrac;
+          const pres = pres0 * (1 - kFrac) + pres1 * kFrac;
+
+          // Also integrate from top face for columnar projection
+          let columnEnergy = 0;
           if (intAxis === 0) {
-            const z = ti;
+            // Integrates along X axis — sample column from top face
             for (let x = 0; x < N; x++) {
-              const w = proxW[x];
-              waveVal += topWave[z * N + x] * w;
-              vortexVal += topVortex[z * N + x] * w;
+              const proxW = (si === 0) 
+                ? Math.exp(-3.0 * (1 - x / N))
+                : Math.exp(-3.0 * (x / N));
+              const topIdx = ti * N + x;
+              columnEnergy += surfaceVorticity[topIdx] * proxW;
             }
           } else {
-            const x = ti;
             for (let z = 0; z < N; z++) {
-              const w = proxW[z];
-              waveVal += topWave[z * N + x] * w;
-              vortexVal += topVortex[z * N + x] * w;
+              const proxW = (si === 2)
+                ? Math.exp(-3.0 * (1 - z / N))
+                : Math.exp(-3.0 * (z / N));
+              const topIdx = z * N + ti;
+              columnEnergy += surfaceVorticity[topIdx] * proxW;
             }
           }
+          columnEnergy /= N;
 
-          waveVal *= invProxSum;
-          vortexVal *= invProxSum;
+          // Combined energy from volumetric slab + column projection
+          const depthDecay = Math.exp(-3.0 * depthFrac) * 0.6 + 
+                            (1.0 / (1.0 + 10.0 * depthFrac * depthFrac)) * 0.4;
+          
+          const volEnergy = (vort + Math.abs(perp) * 0.5 + pres * 0.3) * 0.02;
+          const colEnergy = columnEnergy * depthDecay * 0.015;
+          const totalEnergy = Math.min(1, volEnergy + colEnergy);
 
-          const val = waveVal * wDecay + vortexVal * vDecay;
-          const t = Math.min(1, val * 0.018);
+          // Caustic-like light patterns on sides
+          const causticPhase = ti * 0.3 + tj * 0.2 + time * 1.5;
+          const caustic = Math.max(0, Math.sin(causticPhase) * Math.sin(causticPhase * 0.7)) * totalEnergy * 0.3;
+
+          const t = totalEnergy;
           const t2 = t * t;
 
           const idx = (tj * N + ti) * 4;
-          data[idx] = Math.floor(3 + t2 * color[0]);
-          data[idx + 1] = Math.floor(3 + t2 * color[1]);
-          data[idx + 2] = Math.floor(5 + t2 * color[2]);
+          data[idx]     = Math.floor(Math.min(255, 2 + t2 * color[0] + caustic * 30));
+          data[idx + 1] = Math.floor(Math.min(255, 2 + t2 * color[1] + caustic * 50));
+          data[idx + 2] = Math.floor(Math.min(255, 4 + t2 * color[2] + caustic * 20));
           data[idx + 3] = 255;
         }
       }
       textures[matIdx].needsUpdate = true;
     }
 
-    // ─── Render bottom face (material 3, -Y) ───
+    // ─── 11. Render bottom face from deepest slab layers ───
     {
       const data = textures[3].image.data as Uint8Array;
-      const wFull = depthDecayW[N - 1];
-      const vFull = depthDecayV[N - 1];
-
       for (let j = 0; j < N; j++) {
         for (let i = 0; i < N; i++) {
-          const val = topWave[j * N + i] * wFull + topVortex[j * N + i] * vFull;
-          const t = Math.min(1, val * 0.012);
+          // Sample deepest layer of all 4 slabs and combine
+          let energy = 0;
+          for (let s = 0; s < 4; s++) {
+            const [vort, perp, pres] = slabs[s].sample(i, j, D - 1);
+            energy += (vort + Math.abs(perp) * 0.3 + pres * 0.2) * 0.25;
+          }
+
+          // Add direct top-face projection through full depth
+          const topVort = surfaceVorticity[j * N + i];
+          const fullDecay = Math.exp(-3.0) * 0.6 + (1 / 11) * 0.4; // depthFrac = 1
+          energy += topVort * fullDecay * 0.008;
+
+          const t = Math.min(1, energy * 0.015);
           const t2 = t * t;
 
+          // Deep caustics — slower, more diffuse
+          const caustic = Math.max(0, 
+            Math.sin(i * 0.15 + j * 0.12 + time * 0.8) * 
+            Math.sin(i * 0.08 - time * 0.5)
+          ) * t * 0.25;
+
           const idx = (j * N + i) * 4;
-          data[idx] = Math.floor(2 + t2 * BOTTOM_COLOR[0]);
-          data[idx + 1] = Math.floor(2 + t2 * BOTTOM_COLOR[1]);
-          data[idx + 2] = Math.floor(4 + t2 * BOTTOM_COLOR[2]);
+          data[idx]     = Math.floor(2 + t2 * BOTTOM_COLOR[0] + caustic * 15);
+          data[idx + 1] = Math.floor(2 + t2 * BOTTOM_COLOR[1] + caustic * 25);
+          data[idx + 2] = Math.floor(4 + t2 * BOTTOM_COLOR[2] + caustic * 40);
           data[idx + 3] = 255;
         }
       }
