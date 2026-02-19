@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import CubeFluidDemo from "@/components/CubeFluidDemo";
 
 const FEATURES = [
@@ -133,6 +134,22 @@ export default function Index() {
           </p>
           <p className="mt-4 text-muted-foreground">{"// This single rule produces full 3D vorticity transport."}</p>
         </div>
+      </section>
+
+      {/* SDF Water Link */}
+      <section className="py-20 px-6 max-w-5xl mx-auto text-center">
+        <p className="text-sm font-mono text-primary tracking-widest uppercase mb-4">Next Evolution</p>
+        <h2 className="text-3xl font-bold font-mono mb-4">Volumetric SDF Ocean</h2>
+        <p className="text-muted-foreground max-w-xl mx-auto mb-8">
+          Hierarchical parametric volumetric Signed Distance Field water — fullscreen raymarched with
+          Beer-Lambert absorption, Fresnel reflections, caustics, foam, and adaptive LOD.
+        </p>
+        <Link
+          to="/sdf-water"
+          className="inline-block px-6 py-3 rounded-lg bg-primary text-primary-foreground font-mono font-bold hover:opacity-90 transition-opacity"
+        >
+          Launch SDF Ocean Demo →
+        </Link>
       </section>
 
       {/* Footer */}
