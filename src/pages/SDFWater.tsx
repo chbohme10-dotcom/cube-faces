@@ -1,6 +1,6 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { Link } from "react-router-dom";
-import SDFWaterScene, { DEFAULT_PARAMS, type SDFWaterParams } from "@/components/SDFWaterScene";
+import SDFWaterScene, { DEFAULT_PARAMS, type SDFWaterParams, type SplashData } from "@/components/SDFWaterScene";
 import { Slider } from "@/components/ui/slider";
 
 const CONTROLS: {
@@ -25,11 +25,20 @@ const TAGS = [
   "Adaptive LOD Raymarching",
   "Fresnel + SSS",
   "Jacobian Foam Detection",
+  "Click-to-Splash",
+  "SDF Visualization",
 ];
 
 export default function SDFWater() {
   const [params, setParams] = useState<SDFWaterParams>({ ...DEFAULT_PARAMS });
   const [showPanel, setShowPanel] = useState(false);
+  const [splashes, setSplashes] = useState<SplashData[]>([]);
+  const [vizMode, setVizMode] = useState(0);
+  const clockRef = useRef(0);
+
+  // We need to track the R3F clock time for splash timestamps
+  // Use a simple incrementing ref synced via requestAnimationFrame
+  const startTime = useRef(performance.now() / 1000);
 
   const updateParam = useCallback(
     (key: keyof SDFWaterParams, value: number) => {
@@ -38,11 +47,31 @@ export default function SDFWater() {
     []
   );
 
+  const handleClickOcean = useCallback((x: number, z: number) => {
+    const elapsed = performance.now() / 1000 - startTime.current;
+    const newSplash: SplashData = {
+      x,
+      z,
+      time: elapsed,
+      amplitude: 2.5,
+    };
+    setSplashes((prev) => {
+      const updated = [...prev, newSplash];
+      // Keep only recent splashes
+      return updated.slice(-8);
+    });
+  }, []);
+
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-background">
       {/* Canvas */}
       <div className="absolute inset-0 z-0">
-        <SDFWaterScene params={params} />
+        <SDFWaterScene
+          params={params}
+          splashes={splashes}
+          vizMode={vizMode}
+          onClickOcean={handleClickOcean}
+        />
       </div>
 
       {/* Header overlay */}
@@ -60,17 +89,31 @@ export default function SDFWater() {
               <span className="text-primary">SDF</span> OCEAN
             </h1>
             <p className="mt-1 text-xs md:text-sm text-muted-foreground font-mono max-w-md leading-relaxed drop-shadow-md">
-              Hierarchical Parametric Volumetric Signed Distance Field
+              {vizMode === 0
+                ? "Hierarchical Parametric Volumetric Signed Distance Field"
+                : "SDF Field Visualization — Distance Cross-Sections"}
             </p>
           </div>
 
-          {/* Right: controls toggle */}
-          <button
-            onClick={() => setShowPanel(!showPanel)}
-            className="pointer-events-auto px-3 py-1.5 rounded-lg border border-border bg-card/80 backdrop-blur-md text-xs font-mono text-muted-foreground hover:text-foreground hover:border-primary transition-all"
-          >
-            {showPanel ? "✕ Close" : "⚙ Controls"}
-          </button>
+          {/* Right: controls */}
+          <div className="pointer-events-auto flex gap-2">
+            <button
+              onClick={() => setVizMode(vizMode === 0 ? 1 : 0)}
+              className={`px-3 py-1.5 rounded-lg border text-xs font-mono transition-all backdrop-blur-md ${
+                vizMode === 1
+                  ? "border-primary bg-primary/20 text-primary"
+                  : "border-border bg-card/80 text-muted-foreground hover:text-foreground hover:border-primary"
+              }`}
+            >
+              {vizMode === 0 ? "◈ SDF View" : "◈ Realistic"}
+            </button>
+            <button
+              onClick={() => setShowPanel(!showPanel)}
+              className="px-3 py-1.5 rounded-lg border border-border bg-card/80 backdrop-blur-md text-xs font-mono text-muted-foreground hover:text-foreground hover:border-primary transition-all"
+            >
+              {showPanel ? "✕ Close" : "⚙ Controls"}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -86,6 +129,13 @@ export default function SDFWater() {
             </span>
           ))}
         </div>
+      </div>
+
+      {/* Click hint */}
+      <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+        <p className="text-[10px] font-mono text-muted-foreground/50 bg-card/20 backdrop-blur-sm px-3 py-1 rounded-full">
+          Click the water to create splashes
+        </p>
       </div>
 
       {/* Controls panel */}
@@ -118,8 +168,14 @@ export default function SDFWater() {
           >
             Reset Defaults
           </button>
+          <button
+            onClick={() => setSplashes([])}
+            className="mt-2 w-full py-1.5 rounded-lg border border-border text-xs font-mono text-muted-foreground hover:text-foreground hover:border-primary transition-all"
+          >
+            Clear Splashes
+          </button>
           <p className="mt-3 text-[9px] font-mono text-muted-foreground/50 leading-relaxed">
-            Drag to orbit · Scroll to zoom · Dive below surface for underwater view
+            Drag to orbit · Scroll to zoom · Click water to splash · Dive below for underwater view
           </p>
         </div>
       )}

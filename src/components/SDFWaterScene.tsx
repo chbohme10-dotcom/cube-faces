@@ -1,7 +1,7 @@
 /**
  * SDFWaterScene — Production-quality volumetric SDF ocean raymarcher.
  *
- * Implements the hierarchical parametric volumetric SDF concept:
+ * Features:
  * - 8-component Gerstner wave spectrum (analytical parametric layer)
  * - Adaptive-LOD raymarching (coarse far, detailed near)
  * - Beer-Lambert volumetric absorption (wavelength-dependent)
@@ -12,12 +12,17 @@
  * - Turbulence energy visualization (curl-noise)
  * - Procedural atmospheric sky with sun
  * - Underwater viewing support
+ * - Click-to-splash radial impulse waves
+ * - SDF field visualization mode
  */
 
-import { useRef, useMemo } from "react";
-import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { useRef, useMemo, useCallback } from "react";
+import { Canvas, useFrame, useThree, ThreeEvent } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
+
+// Max simultaneous splashes
+const MAX_SPLASHES = 8;
 
 // ─── Shader sources ───
 
@@ -47,6 +52,13 @@ uniform float uClarity;
 uniform float uSunHeight;
 uniform float uTurbulence;
 
+// Splash system: vec4(x, z, startTime, amplitude) per splash
+uniform vec4 uSplashes[${MAX_SPLASHES}];
+uniform int uSplashCount;
+
+// Visualization mode: 0 = realistic, 1 = SDF field
+uniform int uVizMode;
+
 #define PI 3.14159265359
 #define TAU 6.28318530718
 #define MAX_STEPS 96
@@ -69,9 +81,49 @@ float gJ(vec2 p, float t, float A, float wl, vec2 d, float spd, float ph, float 
   return st * A * k * cos(k * dot(d, p) - k * spd * t + ph);
 }
 
+// ─── Splash ripple waves ───
+float splashHeight(vec2 p, float t) {
+  float h = 0.0;
+  for (int i = 0; i < ${MAX_SPLASHES}; i++) {
+    if (i >= uSplashCount) break;
+    vec4 sp = uSplashes[i];
+    vec2 center = sp.xy;
+    float startTime = sp.z;
+    float amp = sp.w;
+    
+    float age = t - startTime;
+    if (age < 0.0 || age > 12.0) continue;
+    
+    float dist = length(p - center);
+    float decay = exp(-age * 0.35) * exp(-dist * 0.015);
+    
+    // Multi-frequency radial ripples
+    float speed = 8.0;
+    float phase = dist - speed * age;
+    float ripple = 0.0;
+    ripple += sin(phase * 0.8) * 1.0;
+    ripple += sin(phase * 1.6 + 0.5) * 0.4;
+    ripple += sin(phase * 3.2 + 1.0) * 0.15;
+    
+    // Leading edge envelope
+    float envelope = smoothstep(speed * age + 2.0, speed * age - 1.0, dist);
+    envelope *= smoothstep(0.0, 0.5, age); // ramp in
+    
+    h += amp * ripple * decay * envelope;
+  }
+  return h;
+}
+
+vec2 splashGradient(vec2 p, float t) {
+  float eps = 0.3;
+  float hL = splashHeight(p - vec2(eps, 0.0), t);
+  float hR = splashHeight(p + vec2(eps, 0.0), t);
+  float hD = splashHeight(p - vec2(0.0, eps), t);
+  float hU = splashHeight(p + vec2(0.0, eps), t);
+  return vec2(hR - hL, hU - hD) / (2.0 * eps);
+}
+
 // ─── 8-component Gerstner spectrum with LOD ───
-// Primary swell, secondary swell, deep swell always computed.
-// Wind chop, cross chop, capillary only at close range.
 
 float oceanHeight(vec2 p, float t, float dist) {
   float s = uWaveScale;
@@ -96,6 +148,9 @@ float oceanHeight(vec2 p, float t, float dist) {
     h += gW(p, ts, 0.15*s, 5.5, vec2(-0.7,0.7), 2.5, 5.2);
   }
 
+  // Add splash ripples
+  h += splashHeight(p, t);
+
   return h;
 }
 
@@ -112,6 +167,7 @@ float oceanHeightFull(vec2 p, float t) {
   h += gW(p, ts, 0.3*s, 13.0, vec2(0.95,-0.3), 3.5, 1.8);
   h += gW(p, ts, 0.25*s, 8.5, vec2(0.6,-0.8), 3.2, 3.3);
   h += gW(p, ts, 0.15*s, 5.5, vec2(-0.7,0.7), 2.5, 5.2);
+  h += splashHeight(p, t);
   return h;
 }
 
@@ -127,6 +183,8 @@ vec3 oceanNormal(vec2 p, float t) {
   g += gG(p, ts, 0.3*s, 13.0, vec2(0.95,-0.3), 3.5, 1.8);
   g += gG(p, ts, 0.25*s, 8.5, vec2(0.6,-0.8), 3.2, 3.3);
   g += gG(p, ts, 0.15*s, 5.5, vec2(-0.7,0.7), 2.5, 5.2);
+  // Add splash gradient
+  g += splashGradient(p, t);
   return normalize(vec3(-g.x, 1.0, -g.y));
 }
 
@@ -143,7 +201,20 @@ float oceanFoam(vec2 p, float t) {
   j -= gJ(p, ts, 0.8*s, 80.0, vec2(0.0,1.0), 10.0, 4.0, 0.2*c);
   j -= gJ(p, ts, 0.15*s, 5.5, vec2(-0.7,0.7), 2.5, 5.2, 0.3*c);
   j -= gJ(p, ts, 0.3*s, 13.0, vec2(0.95,-0.3), 3.5, 1.8, 0.4*c);
-  return smoothstep(0.0, -0.35, j);
+  
+  // Splash foam
+  float sf = 0.0;
+  for (int i = 0; i < ${MAX_SPLASHES}; i++) {
+    if (i >= uSplashCount) break;
+    vec4 sp = uSplashes[i];
+    float age = uTime - sp.z;
+    if (age < 0.0 || age > 8.0) continue;
+    float dist = length(p - sp.xy);
+    float ring = abs(dist - 8.0 * age);
+    sf += sp.w * 0.3 * exp(-age * 0.5) * exp(-ring * 0.5) * smoothstep(0.0, 0.3, age);
+  }
+  
+  return smoothstep(0.0, -0.35, j) + sf;
 }
 
 // ─── SDF ───
@@ -160,22 +231,18 @@ vec3 sky(vec3 rd) {
   vec3 sunDir = getSunDir();
   float sunDot = max(0.0, dot(rd, sunDir));
 
-  // Rayleigh-like gradient
   float g = max(0.0, rd.y);
   vec3 zenith = vec3(0.12, 0.28, 0.58);
   vec3 horizon = vec3(0.55, 0.65, 0.78);
 
-  // Warm horizon when sun is low
   float sunElev = sunDir.y;
   vec3 warmHorizon = mix(vec3(0.8, 0.45, 0.2), horizon, smoothstep(0.0, 0.5, sunElev));
   vec3 col = mix(warmHorizon, zenith, pow(g, 0.45));
 
-  // Below-horizon fade to dark
   if (rd.y < 0.0) {
     col = mix(warmHorizon * 0.3, col, exp(rd.y * 8.0));
   }
 
-  // Sun disk + glow
   col += vec3(1.0, 0.95, 0.85) * pow(sunDot, 700.0) * 6.0;
   col += vec3(1.0, 0.85, 0.6) * pow(sunDot, 40.0) * 0.5;
   col += vec3(1.0, 0.7, 0.4) * pow(sunDot, 8.0) * 0.15;
@@ -229,6 +296,18 @@ float fresnel(float cosT) {
   return 0.02 + 0.98 * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
 }
 
+// ─── SDF Visualization color map ───
+vec3 sdfColorMap(float d) {
+  // Negative (inside water) = blues/cyans, positive (above) = warm
+  if (d < 0.0) {
+    float t = clamp(-d * 0.3, 0.0, 1.0);
+    return mix(vec3(0.1, 0.6, 0.8), vec3(0.0, 0.05, 0.3), t);
+  } else {
+    float t = clamp(d * 0.3, 0.0, 1.0);
+    return mix(vec3(0.1, 0.8, 0.3), vec3(1.0, 0.3, 0.05), t);
+  }
+}
+
 // ─── Adaptive raymarch ───
 float raymarch(vec3 ro, vec3 rd) {
   float t = 0.1;
@@ -240,7 +319,6 @@ float raymarch(vec3 ro, vec3 rd) {
     float d = sdfOcean(p, t);
 
     if (d < 0.005) {
-      // Linear interpolation for sub-step precision
       t = lastT + (t - lastT) * lastD / (lastD - d + 0.0001);
       break;
     }
@@ -248,7 +326,6 @@ float raymarch(vec3 ro, vec3 rd) {
     lastD = d;
     lastT = t;
 
-    // Adaptive step: larger steps when far, conservative near surface
     t += max(d * 0.45, 0.08 + t * 0.0025);
 
     if (t > MAX_DIST) break;
@@ -258,7 +335,6 @@ float raymarch(vec3 ro, vec3 rd) {
 
 // ─── Main ───
 void main() {
-  // Reconstruct world-space ray from camera
   vec2 ndc = vUv * 2.0 - 1.0;
   vec4 worldFar = uInvProjView * vec4(ndc, 1.0, 1.0);
   worldFar /= worldFar.w;
@@ -270,72 +346,112 @@ void main() {
 
   vec3 sunDir = getSunDir();
 
-  // Check if camera is underwater
   float camH = oceanHeightFull(ro.xz, uTime);
   bool underwater = ro.y < camH;
 
+  // ─── SDF Visualization Mode ───
+  if (uVizMode == 1) {
+    vec3 color = vec3(0.0);
+    float t = 0.1;
+    float accum = 0.0;
+    
+    for (int i = 0; i < 80; i++) {
+      vec3 p = ro + rd * t;
+      float d = sdfOcean(p, t);
+      
+      // Color by distance value
+      vec3 sdfCol = sdfColorMap(d);
+      
+      // Iso-lines at regular intervals
+      float isoLine = 1.0 - smoothstep(0.0, 0.08, abs(fract(d * 0.5) - 0.5) * 2.0);
+      sdfCol = mix(sdfCol, vec3(1.0), isoLine * 0.6);
+      
+      // Zero-crossing highlight (the surface)
+      float zeroCross = 1.0 - smoothstep(0.0, 0.15, abs(d));
+      sdfCol = mix(sdfCol, vec3(1.0, 1.0, 0.0), zeroCross * 0.8);
+      
+      // LOD boundary indicators
+      float lodAlpha = 0.0;
+      vec3 lodCol = vec3(0.0);
+      if (abs(t - 50.0) < 1.5) { lodCol = vec3(1.0, 0.2, 0.2); lodAlpha = 0.4; }
+      if (abs(t - 120.0) < 2.0) { lodCol = vec3(0.2, 0.2, 1.0); lodAlpha = 0.4; }
+      sdfCol = mix(sdfCol, lodCol, lodAlpha);
+      
+      // Volumetric accumulation
+      float alpha = 0.035;
+      color += sdfCol * alpha * (1.0 - accum);
+      accum += alpha * (1.0 - accum);
+      
+      if (accum > 0.95 || t > 150.0) break;
+      t += max(0.3, t * 0.01);
+    }
+    
+    // Background
+    color += sky(rd) * 0.3 * (1.0 - accum);
+    
+    // Grid overlay
+    vec2 screenUV = vUv;
+    float grid = 0.0;
+    grid += smoothstep(0.002, 0.0, abs(fract(screenUV.x * 20.0) - 0.5) - 0.49);
+    grid += smoothstep(0.002, 0.0, abs(fract(screenUV.y * 20.0) - 0.5) - 0.49);
+    color = mix(color, vec3(0.3, 0.4, 0.5), grid * 0.15);
+    
+    color = pow(clamp(color, 0.0, 1.0), vec3(0.4545));
+    gl_FragColor = vec4(color, 1.0);
+    return;
+  }
+
+  // ─── Realistic Mode ───
   float t = raymarch(ro, rd);
   vec3 color;
 
   if (t < MAX_DIST) {
     vec3 p = ro + rd * t;
     vec3 n = oceanNormal(p.xz, uTime);
-    if (underwater) n = -n; // Flip normal when looking up from below
+    if (underwater) n = -n;
 
     vec3 v = -rd;
     float NdotV = max(0.001, dot(n, v));
 
-    // Fresnel
     float F = fresnel(NdotV);
 
-    // Reflection
     vec3 reflDir = reflect(rd, n);
     vec3 refl = sky(reflDir);
 
-    // Sun specular (Blinn-Phong, sharp)
     vec3 halfV = normalize(sunDir + v);
     float NdotH = max(0.0, dot(n, halfV));
     refl += vec3(1.0, 0.95, 0.85) * pow(NdotH, 350.0) * 4.0;
 
-    // Beer-Lambert volumetric absorption
     vec3 absCoeff = vec3(0.42, 0.088, 0.038) * (2.0 - uClarity);
     float viewDepth = max(0.3, t * max(0.01, abs(rd.y)) * 1.5);
     vec3 waterAbs = exp(-absCoeff * viewDepth);
 
-    // Subsurface scattering (light passing through wave crests)
     vec3 refrDir = refract(rd, n, 0.75);
     float sss = pow(max(0.0, dot(sunDir, -refrDir)), 5.0) * 0.45;
     vec3 sssCol = vec3(0.04, 0.28, 0.18) * sss * waterAbs;
 
-    // Deep water base + scattered light
     vec3 deepCol = vec3(0.008, 0.035, 0.07);
     vec3 scatterCol = vec3(0.02, 0.08, 0.12);
     vec3 waterCol = deepCol + scatterCol * waterAbs + sssCol;
 
-    // Caustics (wave-curvature-driven light patterns)
     float caustVal = caustics(p) * waterAbs.g * 0.35 * uClarity;
     waterCol += vec3(0.04, 0.14, 0.1) * caustVal;
 
-    // Turbulence energy (selective internal vortex visualization)
     if (uTurbulence > 0.01) {
       float te = turbulenceField(p * 0.12) * uTurbulence;
       waterCol += vec3(0.0, 0.05, 0.09) * te;
     }
 
-    // Foam from Gerstner Jacobian (wave folding = topology change)
     float foam = oceanFoam(p.xz, uTime);
     vec3 foamCol = vec3(0.82, 0.88, 0.93) * foam;
 
-    // Combine via Fresnel
     if (underwater) {
-      // Underwater: mostly refracted light, dimmed reflection
       color = waterCol * 1.5 + refl * F * 0.3;
     } else {
       color = mix(waterCol, refl, F);
       color += foamCol * (1.0 - F * 0.3);
     }
 
-    // Atmospheric distance fog
     float fog = 1.0 - exp(-t * 0.0035);
     vec3 fogCol = sky(rd) * 0.65;
     color = mix(color, fogCol, fog);
@@ -344,22 +460,16 @@ void main() {
     color = sky(rd);
   }
 
-  // Underwater tint (volumetric absorption from camera to surface/far)
   if (underwater) {
     float uwDepth = camH - ro.y;
     vec3 uwAbs = exp(-vec3(0.42, 0.088, 0.038) * uwDepth * 0.5);
     color *= uwAbs;
-    // Underwater caustics on everything
     color += vec3(0.02, 0.06, 0.04) * caustics(ro + rd * min(t, 20.0)) * uwAbs.g;
-    // Volumetric god-ray approximation
     float godRay = pow(max(0.0, dot(rd, sunDir)), 3.0) * 0.15;
     color += vec3(0.03, 0.1, 0.08) * godRay * uwAbs;
   }
 
-  // ACES-inspired tone mapping
   color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
-
-  // Gamma
   color = pow(clamp(color, 0.0, 1.0), vec3(0.4545));
 
   gl_FragColor = vec4(color, 1.0);
@@ -377,6 +487,13 @@ export interface SDFWaterParams {
   turbulence: number;
 }
 
+export interface SplashData {
+  x: number;
+  z: number;
+  time: number;
+  amplitude: number;
+}
+
 const DEFAULT_PARAMS: SDFWaterParams = {
   waveScale: 1.0,
   timeScale: 1.0,
@@ -386,10 +503,36 @@ const DEFAULT_PARAMS: SDFWaterParams = {
   turbulence: 0.3,
 };
 
-function OceanShader({ params }: { params: SDFWaterParams }) {
+function OceanShader({
+  params,
+  splashes,
+  vizMode,
+  onClickOcean,
+}: {
+  params: SDFWaterParams;
+  splashes: SplashData[];
+  vizMode: number;
+  onClickOcean: (x: number, z: number) => void;
+}) {
   const ref = useRef<THREE.ShaderMaterial>(null);
   const { camera, gl } = useThree();
   const invPV = useMemo(() => new THREE.Matrix4(), []);
+  const raycaster = useMemo(() => new THREE.Raycaster(), []);
+  const planeY = useMemo(() => new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), []);
+  const hitPoint = useMemo(() => new THREE.Vector3(), []);
+
+  // Build splash uniform array
+  const splashArray = useMemo(() => {
+    const arr: number[] = [];
+    for (let i = 0; i < MAX_SPLASHES; i++) {
+      if (i < splashes.length) {
+        arr.push(splashes[i].x, splashes[i].z, splashes[i].time, splashes[i].amplitude);
+      } else {
+        arr.push(0, 0, -100, 0);
+      }
+    }
+    return arr;
+  }, [splashes]);
 
   const uniforms = useMemo(
     () => ({
@@ -403,6 +546,9 @@ function OceanShader({ params }: { params: SDFWaterParams }) {
       uClarity: { value: params.clarity },
       uSunHeight: { value: params.sunHeight },
       uTurbulence: { value: params.turbulence },
+      uSplashes: { value: [] as THREE.Vector4[] },
+      uSplashCount: { value: 0 },
+      uVizMode: { value: 0 },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     []
@@ -424,17 +570,46 @@ function OceanShader({ params }: { params: SDFWaterParams }) {
       .invert();
     mat.uniforms.uInvProjView.value.copy(invPV);
 
-    // Live parameter updates
     mat.uniforms.uWaveScale.value = params.waveScale;
     mat.uniforms.uTimeScale.value = params.timeScale;
     mat.uniforms.uChoppiness.value = params.choppiness;
     mat.uniforms.uClarity.value = params.clarity;
     mat.uniforms.uSunHeight.value = params.sunHeight;
     mat.uniforms.uTurbulence.value = params.turbulence;
+    mat.uniforms.uVizMode.value = vizMode;
+
+    // Update splash uniforms
+    const splashVecs: THREE.Vector4[] = [];
+    for (let i = 0; i < MAX_SPLASHES; i++) {
+      if (i < splashes.length) {
+        splashVecs.push(
+          new THREE.Vector4(splashes[i].x, splashes[i].z, splashes[i].time, splashes[i].amplitude)
+        );
+      } else {
+        splashVecs.push(new THREE.Vector4(0, 0, -100, 0));
+      }
+    }
+    mat.uniforms.uSplashes.value = splashVecs;
+    mat.uniforms.uSplashCount.value = Math.min(splashes.length, MAX_SPLASHES);
   });
 
+  const handleClick = useCallback(
+    (e: ThreeEvent<MouseEvent>) => {
+      e.stopPropagation();
+      // Raycast against y=0 plane to find splash point
+      const ndcX = (e.nativeEvent.offsetX / gl.domElement.clientWidth) * 2 - 1;
+      const ndcY = -(e.nativeEvent.offsetY / gl.domElement.clientHeight) * 2 + 1;
+      raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
+      const hit = raycaster.ray.intersectPlane(planeY, hitPoint);
+      if (hit) {
+        onClickOcean(hitPoint.x, hitPoint.z);
+      }
+    },
+    [camera, gl, raycaster, planeY, hitPoint, onClickOcean]
+  );
+
   return (
-    <mesh frustumCulled={false} renderOrder={-1}>
+    <mesh frustumCulled={false} renderOrder={-1} onClick={handleClick}>
       <planeGeometry args={[2, 2]} />
       <shaderMaterial
         ref={ref}
@@ -450,16 +625,34 @@ function OceanShader({ params }: { params: SDFWaterParams }) {
 
 export default function SDFWaterScene({
   params = DEFAULT_PARAMS,
+  splashes = [],
+  vizMode = 0,
+  onClickOcean,
 }: {
   params?: SDFWaterParams;
+  splashes?: SplashData[];
+  vizMode?: number;
+  onClickOcean?: (x: number, z: number) => void;
 }) {
+  const handleClick = useCallback(
+    (x: number, z: number) => {
+      onClickOcean?.(x, z);
+    },
+    [onClickOcean]
+  );
+
   return (
     <Canvas
       camera={{ position: [0, 10, 30], fov: 55, near: 0.1, far: 500 }}
       gl={{ antialias: true, alpha: false }}
       style={{ background: "#000" }}
     >
-      <OceanShader params={params} />
+      <OceanShader
+        params={params}
+        splashes={splashes}
+        vizMode={vizMode}
+        onClickOcean={handleClick}
+      />
       <OrbitControls
         autoRotate
         autoRotateSpeed={0.15}
