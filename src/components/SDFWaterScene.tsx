@@ -61,7 +61,7 @@ uniform int uVizMode;
 
 #define PI 3.14159265359
 #define TAU 6.28318530718
-#define MAX_STEPS 96
+#define MAX_STEPS 128
 #define MAX_DIST 250.0
 
 // ─── Wave helper functions ───
@@ -110,6 +110,9 @@ float splashHeight(vec2 p, float t) {
     envelope *= smoothstep(0.0, 0.5, age); // ramp in
     
     h += amp * ripple * decay * envelope;
+    
+    // Impact crater depression (cavity before crown rises)
+    h += -amp * 1.5 * exp(-age * 2.5) * exp(-dist * dist / (amp * amp * 3.0));
   }
   return h;
 }
@@ -121,6 +124,195 @@ vec2 splashGradient(vec2 p, float t) {
   float hD = splashHeight(p - vec2(0.0, eps), t);
   float hU = splashHeight(p + vec2(0.0, eps), t);
   return vec2(hR - hL, hU - hD) / (2.0 * eps);
+}
+
+// ─── Smooth minimum for SDF blending ───
+float smin(float a, float b, float k) {
+    float h = max(k - abs(a - b), 0.0) / k;
+    return min(a, b) - h * h * h * k * (1.0 / 6.0);
+}
+
+// ─── Volumetric Splash SDF ───
+// Full 3D splash evolution via SDF primitives:
+//   1. Crown sheet — expanding torus with mass-conserving thinning
+//   2. Rayleigh-Plateau angular breakup → finger ligaments
+//   3. Worthington central jet with capillary necking instability
+//   4. Droplet detachment — velocity-elongated ellipsoid SDFs on ballistic arcs
+//   5. Crown-finger ejecta droplets
+float sdfSplashVolume(vec3 p, float time) {
+    float d = 999.0;
+    float grav = 9.81;
+
+    for (int i = 0; i < ${MAX_SPLASHES}; i++) {
+        if (i >= uSplashCount) break;
+        vec4 sp = uSplashes[i];
+        vec2 center = sp.xy;
+        float t0 = sp.z;
+        float amp = sp.w;
+        float age = time - t0;
+
+        if (age < 0.0 || age > 5.0) continue;
+
+        vec3 lp = vec3(p.x - center.x, p.y, p.z - center.y);
+        float r = length(lp.xz);
+
+        // Bounding rejection
+        float maxR = amp * 6.0 + age * 5.0;
+        float maxH = amp * 14.0;
+        if (r > maxR || lp.y > maxH || lp.y < -2.0) continue;
+
+        float theta = atan(lp.z, lp.x);
+        float sd = 999.0;
+
+        // ── Crown sheet ──
+        float v0c = amp * 4.5;
+        float crownH = v0c * age - 0.5 * grav * age * age;
+        float crownLife = v0c * 2.0 / grav;
+
+        if (crownH > 0.1 && age < crownLife) {
+            float crownR = amp * (0.6 + age * 1.8);
+            float wallThick = amp * 0.4 * max(0.03, exp(-age * 0.7));
+            wallThick = clamp(wallThick, 0.02, amp * 0.4);
+
+            // Torus rim at crown top
+            vec2 torusQ = vec2(r - crownR, lp.y - crownH);
+            float rimD = length(torusQ) - wallThick * 1.5;
+
+            // Conical sheet: ocean surface → crown rim
+            if (lp.y > 0.0 && lp.y < crownH) {
+                float tf = lp.y / crownH;
+                float sheetR = mix(amp * 0.5, crownR, sqrt(tf));
+                float sheetW = wallThick * mix(1.2, 0.5, tf);
+                float sheetD = abs(r - sheetR) - sheetW;
+                rimD = min(rimD, sheetD);
+            }
+
+            // Rayleigh-Plateau angular breakup → fingers
+            float breakup = smoothstep(0.4, 1.2, age);
+            if (breakup > 0.01) {
+                float nFing = floor(6.0 + amp * 2.5);
+                float angWave = pow(max(0.0, sin(nFing * theta)), 2.0);
+                float upperMask = smoothstep(crownH * 0.3, crownH * 0.7, lp.y);
+                rimD += breakup * (1.0 - angWave) * wallThick * 5.0 * upperMask;
+            }
+
+            sd = min(sd, rimD);
+        }
+
+        // ── Worthington central jet ──
+        float jetDelay = 0.15;
+        float jetAge = age - jetDelay;
+        if (jetAge > 0.0) {
+            float v0j = amp * 7.5;
+            float jetH = v0j * jetAge - 0.5 * grav * jetAge * jetAge;
+            float jetLife = v0j * 2.0 / grav;
+
+            if (jetH > -1.0 && jetAge < jetLife + 0.5) {
+                float jetPeak = max(0.3, jetH);
+                float jetR = amp * 0.22 * max(0.03, exp(-jetAge * 0.35));
+
+                // Tapered cylinder body
+                if (lp.y >= -0.1 && lp.y <= jetPeak) {
+                    float frac = clamp(lp.y / max(0.1, jetPeak), 0.0, 1.0);
+                    float taper = jetR * mix(2.0, 0.5, frac);
+                    float cylD = r - taper;
+
+                    // Capillary necking instability along jet length
+                    float neckOnset = smoothstep(0.5, 1.5, jetAge);
+                    if (neckOnset > 0.01) {
+                        float waveNum = 2.8 / max(0.08, jetR);
+                        float neckAmp = neckOnset * taper * 0.55;
+                        cylD += max(0.0, sin(lp.y * waveNum - jetAge * 5.0) * neckAmp);
+                    }
+
+                    sd = min(sd, cylD);
+                }
+
+                // Capillary bulbous tip
+                if (jetPeak > 0.3) {
+                    float tipR = jetR * 2.2;
+                    sd = min(sd, length(vec3(lp.x, lp.y - jetPeak, lp.z)) - tipR);
+                }
+            }
+        }
+
+        // ── Detached droplets ──
+        float dropOnset = smoothstep(1.0, 1.8, age);
+        if (dropOnset > 0.01) {
+            // Jet-tip pinch-off droplets
+            float v0j2 = amp * 7.5;
+            for (int di = 0; di < 5; di++) {
+                float dLaunch = 1.0 + float(di) * 0.18;
+                float dAge = age - dLaunch;
+                if (dAge < 0.0 || dAge > 3.5) continue;
+
+                float dAng = float(di) * 1.885 + amp * 1.3;
+                float vUp = v0j2 * (0.55 - float(di) * 0.07);
+                float vOut = amp * (0.2 + float(di) * 0.25);
+
+                vec3 dP = vec3(
+                    cos(dAng) * vOut * dAge,
+                    vUp * dAge - 0.5 * grav * dAge * dAge,
+                    sin(dAng) * vOut * dAge
+                );
+                if (dP.y < -1.0) continue;
+
+                float dR = amp * 0.12 * (1.2 - float(di) * 0.1);
+                vec3 dV = vec3(cos(dAng)*vOut, vUp - grav*dAge, sin(dAng)*vOut);
+                float spd = length(dV);
+                if (spd > 0.1) {
+                    vec3 dir = dV / spd;
+                    float along = dot(lp - dP, dir);
+                    float perp = length(lp - dP - along * dir);
+                    float stretch = 1.0 + min(3.5, spd * 0.12);
+                    sd = min(sd, length(vec2(perp, along / stretch)) - dR);
+                } else {
+                    sd = min(sd, length(lp - dP) - dR);
+                }
+            }
+
+            // Crown-finger ejecta
+            float nFing2 = floor(6.0 + amp * 2.5);
+            float v0c2 = amp * 4.5;
+            for (int fi = 0; fi < 8; fi++) {
+                if (float(fi) >= nFing2) break;
+                float fLaunch = 0.8 + float(fi) * 0.1;
+                float fAge = age - fLaunch;
+                if (fAge < 0.0 || fAge > 3.0) continue;
+
+                float fAng = (float(fi) + 0.5) * TAU / nFing2;
+                float baseR = amp * (1.2 + fLaunch * 1.5);
+                float vUp = v0c2 * (0.5 + float(fi) * 0.04);
+                float vOut = amp * 1.8;
+
+                vec3 fP = vec3(
+                    cos(fAng) * (baseR + vOut * fAge),
+                    vUp * fAge - 0.5 * grav * fAge * fAge + 1.0,
+                    sin(fAng) * (baseR + vOut * fAge)
+                );
+                if (fP.y < -1.0) continue;
+
+                float fR = amp * 0.1 * (1.0 - float(fi) * 0.04);
+                vec3 fV = vec3(cos(fAng)*vOut, vUp - grav*fAge, sin(fAng)*vOut);
+                float fSpd = length(fV);
+                if (fSpd > 0.1) {
+                    vec3 dir = fV / fSpd;
+                    float along = dot(lp - fP, dir);
+                    float perp = length(lp - fP - along * dir);
+                    float stretch = 1.0 + min(2.5, fSpd * 0.1);
+                    sd = min(sd, length(vec2(perp, along / stretch)) - fR);
+                } else {
+                    sd = min(sd, length(lp - fP) - fR);
+                }
+            }
+        }
+
+        if (sd < 999.0) {
+            d = smin(d, sd, amp * 0.4);
+        }
+    }
+
+    return d;
 }
 
 // ─── 8-component Gerstner spectrum with LOD ───
@@ -222,6 +414,32 @@ float sdfOcean(vec3 p, float dist) {
   return p.y - oceanHeight(p.xz, uTime, dist);
 }
 
+// ─── Combined scene SDF ───
+float sdfScene(vec3 p, float dist) {
+    float ocean = sdfOcean(p, dist);
+    float splash = sdfSplashVolume(p, uTime);
+    return smin(ocean, splash, 0.5);
+}
+
+// ─── Central-difference normal on full 3D SDF ───
+vec3 calcNormal3D(vec3 p, float dist) {
+    float e = 0.1;
+    return normalize(vec3(
+        sdfScene(p + vec3(e,0,0), dist) - sdfScene(p - vec3(e,0,0), dist),
+        sdfScene(p + vec3(0,e,0), dist) - sdfScene(p - vec3(0,e,0), dist),
+        sdfScene(p + vec3(0,0,e), dist) - sdfScene(p - vec3(0,0,e), dist)
+    ));
+}
+
+// ─── Adaptive normal: central-diff near splashes, analytical far ───
+vec3 getHitNormal(vec3 p, float dist) {
+    float splashDist = sdfSplashVolume(p, uTime);
+    if (splashDist < 1.5) {
+        return calcNormal3D(p, dist);
+    }
+    return oceanNormal(p.xz, uTime);
+}
+
 // ─── Procedural sky ───
 vec3 getSunDir() {
   return normalize(vec3(0.8, max(0.05, uSunHeight), -0.6));
@@ -316,7 +534,7 @@ float raymarch(vec3 ro, vec3 rd) {
 
   for (int i = 0; i < MAX_STEPS; i++) {
     vec3 p = ro + rd * t;
-    float d = sdfOcean(p, t);
+    float d = sdfScene(p, t);
 
     if (d < 0.005) {
       t = lastT + (t - lastT) * lastD / (lastD - d + 0.0001);
@@ -357,8 +575,8 @@ void main() {
     
     if (tHit < MAX_DIST) {
       vec3 p = ro + rd * tHit;
-      vec3 n = oceanNormal(p.xz, uTime);
-      float d = sdfOcean(p, tHit);
+      vec3 n = getHitNormal(p, tHit);
+      float d = sdfScene(p, tHit);
       
       // Base: color by surface height
       float h = oceanHeightFull(p.xz, uTime);
@@ -415,7 +633,7 @@ void main() {
 
   if (t < MAX_DIST) {
     vec3 p = ro + rd * t;
-    vec3 n = oceanNormal(p.xz, uTime);
+    vec3 n = getHitNormal(p, t);
     if (underwater) n = -n;
 
     vec3 v = -rd;
