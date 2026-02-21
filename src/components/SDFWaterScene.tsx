@@ -351,50 +351,58 @@ void main() {
 
   // ─── SDF Visualization Mode ───
   if (uVizMode == 1) {
-    vec3 color = vec3(0.0);
-    float t = 0.1;
-    float accum = 0.0;
+    // Raymarch to find the surface like normal mode
+    float tHit = raymarch(ro, rd);
+    vec3 color;
     
-    for (int i = 0; i < 80; i++) {
-      vec3 p = ro + rd * t;
-      float d = sdfOcean(p, t);
+    if (tHit < MAX_DIST) {
+      vec3 p = ro + rd * tHit;
+      vec3 n = oceanNormal(p.xz, uTime);
+      float d = sdfOcean(p, tHit);
       
-      // Color by distance value
-      vec3 sdfCol = sdfColorMap(d);
+      // Base: color by surface height
+      float h = oceanHeightFull(p.xz, uTime);
+      float hNorm = clamp(h * 0.15 + 0.5, 0.0, 1.0);
+      vec3 lowCol = vec3(0.05, 0.15, 0.6);  // deep blue for troughs
+      vec3 midCol = vec3(0.1, 0.5, 0.4);    // teal for mid
+      vec3 highCol = vec3(0.9, 0.95, 1.0);  // white for crests
+      color = hNorm < 0.5 
+        ? mix(lowCol, midCol, hNorm * 2.0)
+        : mix(midCol, highCol, (hNorm - 0.5) * 2.0);
       
-      // Iso-lines at regular intervals
-      float isoLine = 1.0 - smoothstep(0.0, 0.08, abs(fract(d * 0.5) - 0.5) * 2.0);
-      sdfCol = mix(sdfCol, vec3(1.0), isoLine * 0.6);
+      // Iso-lines at height intervals  
+      float isoLine = 1.0 - smoothstep(0.0, 0.06, abs(fract(h * 0.5) - 0.5) * 2.0);
+      color = mix(color, vec3(1.0), isoLine * 0.5);
       
-      // Zero-crossing highlight (the surface)
-      float zeroCross = 1.0 - smoothstep(0.0, 0.15, abs(d));
-      sdfCol = mix(sdfCol, vec3(1.0, 1.0, 0.0), zeroCross * 0.8);
+      // Foam / Jacobian overlay
+      float foam = oceanFoam(p.xz, uTime);
+      color = mix(color, vec3(1.0, 0.3, 0.1), foam * 0.6);
       
-      // LOD boundary indicators
-      float lodAlpha = 0.0;
-      vec3 lodCol = vec3(0.0);
-      if (abs(t - 50.0) < 1.5) { lodCol = vec3(1.0, 0.2, 0.2); lodAlpha = 0.4; }
-      if (abs(t - 120.0) < 2.0) { lodCol = vec3(0.2, 0.2, 1.0); lodAlpha = 0.4; }
-      sdfCol = mix(sdfCol, lodCol, lodAlpha);
+      // LOD boundary rings (distance from camera)
+      float distToCam = length(p.xz - ro.xz);
+      float lod1 = 1.0 - smoothstep(0.0, 2.0, abs(distToCam - 50.0));
+      float lod2 = 1.0 - smoothstep(0.0, 3.0, abs(distToCam - 120.0));
+      color = mix(color, vec3(1.0, 0.2, 0.2), lod1 * 0.5);
+      color = mix(color, vec3(0.2, 0.4, 1.0), lod2 * 0.5);
       
-      // Volumetric accumulation
-      float alpha = 0.035;
-      color += sdfCol * alpha * (1.0 - accum);
-      accum += alpha * (1.0 - accum);
+      // Wireframe-style normal shading
+      float NdotL = max(0.0, dot(n, getSunDir()));
+      color *= 0.4 + 0.6 * NdotL;
       
-      if (accum > 0.95 || t > 150.0) break;
-      t += max(0.3, t * 0.01);
+      // Distance fog
+      float fog = 1.0 - exp(-tHit * 0.006);
+      color = mix(color, vec3(0.15, 0.18, 0.25), fog);
+    } else {
+      // Sky with dark tint for diagnostic look
+      color = sky(rd) * 0.5;
     }
-    
-    // Background
-    color += sky(rd) * 0.3 * (1.0 - accum);
     
     // Grid overlay
     vec2 screenUV = vUv;
     float grid = 0.0;
     grid += smoothstep(0.002, 0.0, abs(fract(screenUV.x * 20.0) - 0.5) - 0.49);
     grid += smoothstep(0.002, 0.0, abs(fract(screenUV.y * 20.0) - 0.5) - 0.49);
-    color = mix(color, vec3(0.3, 0.4, 0.5), grid * 0.15);
+    color = mix(color, vec3(0.3, 0.4, 0.5), grid * 0.1);
     
     color = pow(clamp(color, 0.0, 1.0), vec3(0.4545));
     gl_FragColor = vec4(color, 1.0);
@@ -503,23 +511,42 @@ const DEFAULT_PARAMS: SDFWaterParams = {
   turbulence: 0.3,
 };
 
+function ClickPlane({ onClickOcean }: { onClickOcean: (x: number, z: number) => void }) {
+  const handleClick = useCallback(
+    (e: ThreeEvent<MouseEvent>) => {
+      e.stopPropagation();
+      if (e.point) {
+        onClickOcean(e.point.x, e.point.z);
+      }
+    },
+    [onClickOcean]
+  );
+
+  return (
+    <mesh
+      rotation={[-Math.PI / 2, 0, 0]}
+      position={[0, 0, 0]}
+      onClick={handleClick}
+      visible={false}
+    >
+      <planeGeometry args={[500, 500]} />
+      <meshBasicMaterial />
+    </mesh>
+  );
+}
+
 function OceanShader({
   params,
   splashes,
   vizMode,
-  onClickOcean,
 }: {
   params: SDFWaterParams;
   splashes: SplashData[];
   vizMode: number;
-  onClickOcean: (x: number, z: number) => void;
 }) {
   const ref = useRef<THREE.ShaderMaterial>(null);
   const { camera, gl } = useThree();
   const invPV = useMemo(() => new THREE.Matrix4(), []);
-  const raycaster = useMemo(() => new THREE.Raycaster(), []);
-  const planeY = useMemo(() => new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), []);
-  const hitPoint = useMemo(() => new THREE.Vector3(), []);
 
   // Build splash uniform array
   const splashArray = useMemo(() => {
@@ -593,23 +620,8 @@ function OceanShader({
     mat.uniforms.uSplashCount.value = Math.min(splashes.length, MAX_SPLASHES);
   });
 
-  const handleClick = useCallback(
-    (e: ThreeEvent<MouseEvent>) => {
-      e.stopPropagation();
-      // Raycast against y=0 plane to find splash point
-      const ndcX = (e.nativeEvent.offsetX / gl.domElement.clientWidth) * 2 - 1;
-      const ndcY = -(e.nativeEvent.offsetY / gl.domElement.clientHeight) * 2 + 1;
-      raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
-      const hit = raycaster.ray.intersectPlane(planeY, hitPoint);
-      if (hit) {
-        onClickOcean(hitPoint.x, hitPoint.z);
-      }
-    },
-    [camera, gl, raycaster, planeY, hitPoint, onClickOcean]
-  );
-
   return (
-    <mesh frustumCulled={false} renderOrder={-1} onClick={handleClick}>
+    <mesh frustumCulled={false} renderOrder={-1}>
       <planeGeometry args={[2, 2]} />
       <shaderMaterial
         ref={ref}
@@ -651,8 +663,8 @@ export default function SDFWaterScene({
         params={params}
         splashes={splashes}
         vizMode={vizMode}
-        onClickOcean={handleClick}
       />
+      <ClickPlane onClickOcean={handleClick} />
       <OrbitControls
         autoRotate
         autoRotateSpeed={0.15}
