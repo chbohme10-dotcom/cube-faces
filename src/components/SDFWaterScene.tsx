@@ -1,28 +1,30 @@
 /**
- * SDFWaterScene — Production-quality volumetric SDF ocean raymarcher.
+ * SDFWaterScene — Hybrid Multi-Regime Volumetric Ocean
  *
- * Features:
- * - 8-component Gerstner wave spectrum (analytical parametric layer)
- * - Adaptive-LOD raymarching (coarse far, detailed near)
- * - Beer-Lambert volumetric absorption (wavelength-dependent)
- * - Subsurface scattering approximation
- * - Fresnel reflection/refraction split
- * - Caustic light patterns from wave curvature
- * - Foam/whitecaps from Gerstner Jacobian (wave folding detection)
- * - Turbulence energy visualization (curl-noise)
- * - Procedural atmospheric sky with sun
- * - Underwater viewing support
- * - Click-to-splash radial impulse waves
- * - SDF field visualization mode
+ * Architecture:
+ * 1. Gerstner heightfield (attached surface regime)
+ * 2. Polarized energy heatmap (surface intent fields: R, U, C, M)
+ * 3. MLS-MPM particle solver (detached volumetric regime)
+ * 4. SDF metaball rendering of particles with velocity-stretch (sheet/ribbon/droplet)
+ * 5. Smooth-minimum blending of particle SDF with ocean heightfield
+ * 6. Regime-aware shading (dense→sheet, stretched→filament, isolated→droplet)
+ * 7. Reabsorption (particles re-enter ocean surface)
+ *
+ * The particle representation naturally emerges from physics:
+ * - Dense clusters → sheets (smin blending merges them)
+ * - Fast elongated motion → ribbons/filaments
+ * - Isolated particles → droplets
+ * No explicit regime assignment needed — geometry emerges from MLS-MPM dynamics.
  */
 
-import { useRef, useMemo, useCallback } from "react";
+import { useRef, useMemo, useCallback, useEffect } from "react";
 import { Canvas, useFrame, useThree, ThreeEvent } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
+import { MLSMPMSolver, MAX_PARTICLES } from "@/lib/mlsMpmCPU";
 
-// Max simultaneous splashes
 const MAX_SPLASHES = 8;
+const MAX_MPM_SHADER = 128; // Max particles queried per ray step
 
 // ─── Shader sources ───
 
@@ -52,11 +54,17 @@ uniform float uClarity;
 uniform float uSunHeight;
 uniform float uTurbulence;
 
-// Splash system: vec4(x, z, startTime, amplitude) per splash
+// Splash ripple system
 uniform vec4 uSplashes[${MAX_SPLASHES}];
 uniform int uSplashCount;
 
-// Visualization mode: 0 = realistic, 1 = SDF field
+// MLS-MPM particle data (DataTexture: width=512, height=3)
+uniform sampler2D uMpmTex;
+uniform int uMpmCount;
+uniform vec3 uMpmBoundsMin;
+uniform vec3 uMpmBoundsMax;
+
+// Visualization mode
 uniform int uVizMode;
 
 #define PI 3.14159265359
@@ -64,7 +72,7 @@ uniform int uVizMode;
 #define MAX_STEPS 128
 #define MAX_DIST 250.0
 
-// ─── Wave helper functions ───
+// ─── Wave helpers ───
 
 float gW(vec2 p, float t, float A, float wl, vec2 d, float spd, float ph) {
   float k = TAU / wl;
@@ -81,238 +89,157 @@ float gJ(vec2 p, float t, float A, float wl, vec2 d, float spd, float ph, float 
   return st * A * k * cos(k * dot(d, p) - k * spd * t + ph);
 }
 
-// ─── Splash ripple waves ───
+// ─── Splash ripples (2D heightfield perturbation) ───
 float splashHeight(vec2 p, float t) {
   float h = 0.0;
   for (int i = 0; i < ${MAX_SPLASHES}; i++) {
     if (i >= uSplashCount) break;
     vec4 sp = uSplashes[i];
-    vec2 center = sp.xy;
-    float startTime = sp.z;
-    float amp = sp.w;
-    
-    float age = t - startTime;
+    float age = t - sp.z;
     if (age < 0.0 || age > 12.0) continue;
-    
-    float dist = length(p - center);
+    float dist = length(p - sp.xy);
     float decay = exp(-age * 0.35) * exp(-dist * 0.015);
-    
-    // Multi-frequency radial ripples
     float speed = 8.0;
     float phase = dist - speed * age;
-    float ripple = 0.0;
-    ripple += sin(phase * 0.8) * 1.0;
-    ripple += sin(phase * 1.6 + 0.5) * 0.4;
-    ripple += sin(phase * 3.2 + 1.0) * 0.15;
-    
-    // Leading edge envelope
-    float envelope = smoothstep(speed * age + 2.0, speed * age - 1.0, dist);
-    envelope *= smoothstep(0.0, 0.5, age); // ramp in
-    
-    h += amp * ripple * decay * envelope;
-    
-    // Impact crater depression (cavity before crown rises)
-    h += -amp * 1.5 * exp(-age * 2.5) * exp(-dist * dist / (amp * amp * 3.0));
+    float ripple = sin(phase * 0.8) + sin(phase * 1.6 + 0.5) * 0.4 + sin(phase * 3.2 + 1.0) * 0.15;
+    float envelope = smoothstep(speed * age + 2.0, speed * age - 1.0, dist) * smoothstep(0.0, 0.5, age);
+    h += sp.w * ripple * decay * envelope;
+    h += -sp.w * 1.5 * exp(-age * 2.5) * exp(-dist * dist / (sp.w * sp.w * 3.0));
   }
   return h;
 }
 
 vec2 splashGradient(vec2 p, float t) {
   float eps = 0.3;
-  float hL = splashHeight(p - vec2(eps, 0.0), t);
-  float hR = splashHeight(p + vec2(eps, 0.0), t);
-  float hD = splashHeight(p - vec2(0.0, eps), t);
-  float hU = splashHeight(p + vec2(0.0, eps), t);
-  return vec2(hR - hL, hU - hD) / (2.0 * eps);
+  return vec2(
+    splashHeight(p + vec2(eps, 0.0), t) - splashHeight(p - vec2(eps, 0.0), t),
+    splashHeight(p + vec2(0.0, eps), t) - splashHeight(p - vec2(0.0, eps), t)
+  ) / (2.0 * eps);
 }
 
-// ─── Smooth minimum for SDF blending ───
+// ─── Smooth minimum ───
 float smin(float a, float b, float k) {
-    float h = max(k - abs(a - b), 0.0) / k;
-    return min(a, b) - h * h * h * k * (1.0 / 6.0);
+  float h = max(k - abs(a - b), 0.0) / k;
+  return min(a, b) - h * h * h * k * (1.0 / 6.0);
 }
 
-// ─── Volumetric Splash SDF ───
-// Full 3D splash evolution via SDF primitives:
-//   1. Crown sheet — expanding torus with mass-conserving thinning
-//   2. Rayleigh-Plateau angular breakup → finger ligaments
-//   3. Worthington central jet with capillary necking instability
-//   4. Droplet detachment — velocity-elongated ellipsoid SDFs on ballistic arcs
-//   5. Crown-finger ejecta droplets
-float sdfSplashVolume(vec3 p, float time) {
-    float d = 999.0;
-    float grav = 9.81;
+// ─── MLS-MPM Particle SDF ───
+// Reads particle data from DataTexture, computes metaball field
+// with velocity-aligned stretching for organic sheet/ribbon/droplet shapes.
+float sdfMpmParticles(vec3 p) {
+  if (uMpmCount <= 0) return 999.0;
 
-    for (int i = 0; i < ${MAX_SPLASHES}; i++) {
-        if (i >= uSplashCount) break;
-        vec4 sp = uSplashes[i];
-        vec2 center = sp.xy;
-        float t0 = sp.z;
-        float amp = sp.w;
-        float age = time - t0;
+  // Broad-phase bounding box rejection
+  vec3 margin = vec3(2.0);
+  if (p.x < uMpmBoundsMin.x - margin.x || p.x > uMpmBoundsMax.x + margin.x ||
+      p.y < uMpmBoundsMin.y - margin.y || p.y > uMpmBoundsMax.y + margin.y ||
+      p.z < uMpmBoundsMin.z - margin.z || p.z > uMpmBoundsMax.z + margin.z) {
+    return 999.0;
+  }
 
-        if (age < 0.0 || age > 5.0) continue;
+  float d = 999.0;
+  int count = min(uMpmCount, ${MAX_MPM_SHADER});
 
-        vec3 lp = vec3(p.x - center.x, p.y, p.z - center.y);
-        float r = length(lp.xz);
+  for (int i = 0; i < ${MAX_MPM_SHADER}; i++) {
+    if (i >= count) break;
 
-        // Bounding rejection
-        float maxR = amp * 6.0 + age * 5.0;
-        float maxH = amp * 14.0;
-        if (r > maxR || lp.y > maxH || lp.y < -2.0) continue;
+    // texelFetch from DataTexture (width=512, height=3)
+    vec4 posR = texelFetch(uMpmTex, ivec2(i, 0), 0);
+    vec4 velD = texelFetch(uMpmTex, ivec2(i, 1), 0);
+    vec4 meta = texelFetch(uMpmTex, ivec2(i, 2), 0);
 
-        float theta = atan(lp.z, lp.x);
-        float sd = 999.0;
+    vec3 pp = posR.xyz;
+    float radius = posR.w;
+    vec3 vel = velD.xyz;
+    float density = velD.w;
+    float age = meta.x;
+    float regime = meta.y;
 
-        // ── Crown sheet ──
-        float v0c = amp * 4.5;
-        float crownH = v0c * age - 0.5 * grav * age * age;
-        float crownLife = v0c * 2.0 / grav;
+    // Quick distance rejection per particle
+    vec3 diff = p - pp;
+    float roughDist = length(diff);
+    if (roughDist > radius * 8.0) continue;
 
-        if (crownH > 0.1 && age < crownLife) {
-            float crownR = amp * (0.6 + age * 1.8);
-            float wallThick = amp * 0.4 * max(0.03, exp(-age * 0.7));
-            wallThick = clamp(wallThick, 0.02, amp * 0.4);
+    float speed = length(vel);
+    float pd;
 
-            // Torus rim at crown top
-            vec2 torusQ = vec2(r - crownR, lp.y - crownH);
-            float rimD = length(torusQ) - wallThick * 1.5;
+    if (speed > 1.0) {
+      // Velocity-aligned ellipsoid → creates ribbons and stretched sheets
+      vec3 dir = vel / speed;
+      float along = dot(diff, dir);
+      float perp = length(diff - along * dir);
 
-            // Conical sheet: ocean surface → crown rim
-            if (lp.y > 0.0 && lp.y < crownH) {
-                float tf = lp.y / crownH;
-                float sheetR = mix(amp * 0.5, crownR, sqrt(tf));
-                float sheetW = wallThick * mix(1.2, 0.5, tf);
-                float sheetD = abs(r - sheetR) - sheetW;
-                rimD = min(rimD, sheetD);
-            }
+      // Stretch increases with speed: fast = long ribbon, slow = round droplet
+      float stretch = 1.0 + min(4.0, speed * 0.12);
 
-            // Rayleigh-Plateau angular breakup → fingers
-            float breakup = smoothstep(0.4, 1.2, age);
-            if (breakup > 0.01) {
-                float nFing = floor(6.0 + amp * 2.5);
-                float angWave = pow(max(0.0, sin(nFing * theta)), 2.0);
-                float upperMask = smoothstep(crownH * 0.3, crownH * 0.7, lp.y);
-                rimD += breakup * (1.0 - angWave) * wallThick * 5.0 * upperMask;
-            }
+      // Sheet regime: flatten perpendicular to velocity for thin sheet appearance
+      if (regime < 0.5 && density > 2.0) {
+        stretch *= 1.5; // More elongated in sheet mode
+        radius *= 1.2;  // Slightly larger for sheet connectivity
+      }
 
-            sd = min(sd, rimD);
-        }
-
-        // ── Worthington central jet ──
-        float jetDelay = 0.15;
-        float jetAge = age - jetDelay;
-        if (jetAge > 0.0) {
-            float v0j = amp * 7.5;
-            float jetH = v0j * jetAge - 0.5 * grav * jetAge * jetAge;
-            float jetLife = v0j * 2.0 / grav;
-
-            if (jetH > -1.0 && jetAge < jetLife + 0.5) {
-                float jetPeak = max(0.3, jetH);
-                float jetR = amp * 0.22 * max(0.03, exp(-jetAge * 0.35));
-
-                // Tapered cylinder body
-                if (lp.y >= -0.1 && lp.y <= jetPeak) {
-                    float frac = clamp(lp.y / max(0.1, jetPeak), 0.0, 1.0);
-                    float taper = jetR * mix(2.0, 0.5, frac);
-                    float cylD = r - taper;
-
-                    // Capillary necking instability along jet length
-                    float neckOnset = smoothstep(0.5, 1.5, jetAge);
-                    if (neckOnset > 0.01) {
-                        float waveNum = 2.8 / max(0.08, jetR);
-                        float neckAmp = neckOnset * taper * 0.55;
-                        cylD += max(0.0, sin(lp.y * waveNum - jetAge * 5.0) * neckAmp);
-                    }
-
-                    sd = min(sd, cylD);
-                }
-
-                // Capillary bulbous tip
-                if (jetPeak > 0.3) {
-                    float tipR = jetR * 2.2;
-                    sd = min(sd, length(vec3(lp.x, lp.y - jetPeak, lp.z)) - tipR);
-                }
-            }
-        }
-
-        // ── Detached droplets ──
-        float dropOnset = smoothstep(1.0, 1.8, age);
-        if (dropOnset > 0.01) {
-            // Jet-tip pinch-off droplets
-            float v0j2 = amp * 7.5;
-            for (int di = 0; di < 5; di++) {
-                float dLaunch = 1.0 + float(di) * 0.18;
-                float dAge = age - dLaunch;
-                if (dAge < 0.0 || dAge > 3.5) continue;
-
-                float dAng = float(di) * 1.885 + amp * 1.3;
-                float vUp = v0j2 * (0.55 - float(di) * 0.07);
-                float vOut = amp * (0.2 + float(di) * 0.25);
-
-                vec3 dP = vec3(
-                    cos(dAng) * vOut * dAge,
-                    vUp * dAge - 0.5 * grav * dAge * dAge,
-                    sin(dAng) * vOut * dAge
-                );
-                if (dP.y < -1.0) continue;
-
-                float dR = amp * 0.12 * (1.2 - float(di) * 0.1);
-                vec3 dV = vec3(cos(dAng)*vOut, vUp - grav*dAge, sin(dAng)*vOut);
-                float spd = length(dV);
-                if (spd > 0.1) {
-                    vec3 dir = dV / spd;
-                    float along = dot(lp - dP, dir);
-                    float perp = length(lp - dP - along * dir);
-                    float stretch = 1.0 + min(3.5, spd * 0.12);
-                    sd = min(sd, length(vec2(perp, along / stretch)) - dR);
-                } else {
-                    sd = min(sd, length(lp - dP) - dR);
-                }
-            }
-
-            // Crown-finger ejecta
-            float nFing2 = floor(6.0 + amp * 2.5);
-            float v0c2 = amp * 4.5;
-            for (int fi = 0; fi < 8; fi++) {
-                if (float(fi) >= nFing2) break;
-                float fLaunch = 0.8 + float(fi) * 0.1;
-                float fAge = age - fLaunch;
-                if (fAge < 0.0 || fAge > 3.0) continue;
-
-                float fAng = (float(fi) + 0.5) * TAU / nFing2;
-                float baseR = amp * (1.2 + fLaunch * 1.5);
-                float vUp = v0c2 * (0.5 + float(fi) * 0.04);
-                float vOut = amp * 1.8;
-
-                vec3 fP = vec3(
-                    cos(fAng) * (baseR + vOut * fAge),
-                    vUp * fAge - 0.5 * grav * fAge * fAge + 1.0,
-                    sin(fAng) * (baseR + vOut * fAge)
-                );
-                if (fP.y < -1.0) continue;
-
-                float fR = amp * 0.1 * (1.0 - float(fi) * 0.04);
-                vec3 fV = vec3(cos(fAng)*vOut, vUp - grav*fAge, sin(fAng)*vOut);
-                float fSpd = length(fV);
-                if (fSpd > 0.1) {
-                    vec3 dir = fV / fSpd;
-                    float along = dot(lp - fP, dir);
-                    float perp = length(lp - fP - along * dir);
-                    float stretch = 1.0 + min(2.5, fSpd * 0.1);
-                    sd = min(sd, length(vec2(perp, along / stretch)) - fR);
-                } else {
-                    sd = min(sd, length(lp - fP) - fR);
-                }
-            }
-        }
-
-        if (sd < 999.0) {
-            d = smin(d, sd, amp * 0.4);
-        }
+      pd = length(vec2(perp, along / stretch)) - radius;
+    } else {
+      pd = roughDist - radius;
     }
 
-    return d;
+    // Blend radius depends on regime: sheets blend widely, droplets blend tightly
+    float blendK = regime < 0.5 ? 0.6 : regime < 1.5 ? 0.4 : 0.2;
+    d = smin(d, pd, blendK);
+
+    // Early exit if we're clearly inside the surface
+    if (d < -0.5) break;
+  }
+
+  return d;
+}
+
+// ─── Surface Intent Fields (Polarized Energy Heatmap) ───
+// Computes rupture potential R from wave Jacobian, slope, and vertical velocity.
+// This drives automatic particle spawning on the CPU side.
+float rupturePotential(vec2 p, float t) {
+  float s = uWaveScale;
+  float ts = t * uTimeScale;
+
+  // Jacobian-based folding (same as foam detection)
+  float j = 1.0;
+  float c = uChoppiness;
+  j -= gJ(p, ts, 1.2*s, 60.0, vec2(0.8,0.6), 8.0, 0.0, 0.4*c);
+  j -= gJ(p, ts, 0.9*s, 42.0, vec2(-0.447,0.894), 6.5, 1.5, 0.35*c);
+  j -= gJ(p, ts, 0.6*s, 26.0, vec2(0.3,-0.95), 5.2, 0.7, 0.5*c);
+  j -= gJ(p, ts, 0.4*s, 16.0, vec2(-0.9,-0.44), 4.0, 2.1, 0.45*c);
+  float folding = smoothstep(0.0, -0.4, j);
+
+  // Slope severity
+  vec2 grad = vec2(0.0);
+  grad += gG(p, ts, 1.2*s, 60.0, vec2(0.8,0.6), 8.0, 0.0);
+  grad += gG(p, ts, 0.9*s, 42.0, vec2(-0.447,0.894), 6.5, 1.5);
+  grad += gG(p, ts, 0.6*s, 26.0, vec2(0.3,-0.95), 5.2, 0.7);
+  float slope = length(grad);
+
+  // Vertical velocity (finite difference)
+  float h0 = gW(p, ts, 1.2*s, 60.0, vec2(0.8,0.6), 8.0, 0.0)
+            + gW(p, ts, 0.9*s, 42.0, vec2(-0.447,0.894), 6.5, 1.5)
+            + gW(p, ts, 0.8*s, 80.0, vec2(0.0,1.0), 10.0, 4.0);
+  float h1 = gW(p, ts - 0.05*uTimeScale, 1.2*s, 60.0, vec2(0.8,0.6), 8.0, 0.0)
+            + gW(p, ts - 0.05*uTimeScale, 0.9*s, 42.0, vec2(-0.447,0.894), 6.5, 1.5)
+            + gW(p, ts - 0.05*uTimeScale, 0.8*s, 80.0, vec2(0.0,1.0), 10.0, 4.0);
+  float vUp = max(0.0, (h0 - h1) / 0.05);
+
+  // Composite rupture potential
+  return folding * 0.4 + slope * 0.25 + vUp * 0.35;
+}
+
+// Surface momentum direction (horizontal transport from wave gradients)
+vec2 surfaceMomentum(vec2 p, float t) {
+  float s = uWaveScale;
+  float ts = t * uTimeScale;
+  vec2 u = vec2(0.0);
+  // Weight by amplitude * frequency for momentum contribution
+  u += gG(p, ts, 1.2*s, 60.0, vec2(0.8,0.6), 8.0, 0.0) * 8.0;
+  u += gG(p, ts, 0.9*s, 42.0, vec2(-0.447,0.894), 6.5, 1.5) * 6.5;
+  u += gG(p, ts, 0.6*s, 26.0, vec2(0.3,-0.95), 5.2, 0.7) * 5.2;
+  return u;
 }
 
 // ─── 8-component Gerstner spectrum with LOD ───
@@ -321,32 +248,22 @@ float oceanHeight(vec2 p, float t, float dist) {
   float s = uWaveScale;
   float ts = t * uTimeScale;
   float h = 0.0;
-
-  // Large waves (always)
   h += gW(p, ts, 1.2*s, 60.0, vec2(0.8,0.6), 8.0, 0.0);
   h += gW(p, ts, 0.9*s, 42.0, vec2(-0.447,0.894), 6.5, 1.5);
   h += gW(p, ts, 0.8*s, 80.0, vec2(0.0,1.0), 10.0, 4.0);
-
-  // Medium waves (LOD 1)
   if (dist < 120.0) {
     h += gW(p, ts, 0.6*s, 26.0, vec2(0.3,-0.95), 5.2, 0.7);
     h += gW(p, ts, 0.4*s, 16.0, vec2(-0.9,-0.44), 4.0, 2.1);
     h += gW(p, ts, 0.3*s, 13.0, vec2(0.95,-0.3), 3.5, 1.8);
   }
-
-  // Fine waves (LOD 2 — only near camera)
   if (dist < 50.0) {
     h += gW(p, ts, 0.25*s, 8.5, vec2(0.6,-0.8), 3.2, 3.3);
     h += gW(p, ts, 0.15*s, 5.5, vec2(-0.7,0.7), 2.5, 5.2);
   }
-
-  // Add splash ripples
   h += splashHeight(p, t);
-
   return h;
 }
 
-// Full-detail height (for shading at hit point)
 float oceanHeightFull(vec2 p, float t) {
   float s = uWaveScale;
   float ts = t * uTimeScale;
@@ -375,7 +292,6 @@ vec3 oceanNormal(vec2 p, float t) {
   g += gG(p, ts, 0.3*s, 13.0, vec2(0.95,-0.3), 3.5, 1.8);
   g += gG(p, ts, 0.25*s, 8.5, vec2(0.6,-0.8), 3.2, 3.3);
   g += gG(p, ts, 0.15*s, 5.5, vec2(-0.7,0.7), 2.5, 5.2);
-  // Add splash gradient
   g += splashGradient(p, t);
   return normalize(vec3(-g.x, 1.0, -g.y));
 }
@@ -393,8 +309,7 @@ float oceanFoam(vec2 p, float t) {
   j -= gJ(p, ts, 0.8*s, 80.0, vec2(0.0,1.0), 10.0, 4.0, 0.2*c);
   j -= gJ(p, ts, 0.15*s, 5.5, vec2(-0.7,0.7), 2.5, 5.2, 0.3*c);
   j -= gJ(p, ts, 0.3*s, 13.0, vec2(0.95,-0.3), 3.5, 1.8, 0.4*c);
-  
-  // Splash foam
+
   float sf = 0.0;
   for (int i = 0; i < ${MAX_SPLASHES}; i++) {
     if (i >= uSplashCount) break;
@@ -405,42 +320,41 @@ float oceanFoam(vec2 p, float t) {
     float ring = abs(dist - 8.0 * age);
     sf += sp.w * 0.3 * exp(-age * 0.5) * exp(-ring * 0.5) * smoothstep(0.0, 0.3, age);
   }
-  
+
   return smoothstep(0.0, -0.35, j) + sf;
 }
 
-// ─── SDF ───
+// ─── Scene SDF: ocean heightfield + MLS-MPM particles ───
 float sdfOcean(vec3 p, float dist) {
   return p.y - oceanHeight(p.xz, uTime, dist);
 }
 
-// ─── Combined scene SDF ───
 float sdfScene(vec3 p, float dist) {
-    float ocean = sdfOcean(p, dist);
-    float splash = sdfSplashVolume(p, uTime);
-    return smin(ocean, splash, 0.5);
+  float ocean = sdfOcean(p, dist);
+  float particles = sdfMpmParticles(p);
+  // Smooth blend: particles merge organically into ocean surface
+  return smin(ocean, particles, 0.5);
 }
 
-// ─── Central-difference normal on full 3D SDF ───
+// ─── Normals ───
 vec3 calcNormal3D(vec3 p, float dist) {
-    float e = 0.1;
-    return normalize(vec3(
-        sdfScene(p + vec3(e,0,0), dist) - sdfScene(p - vec3(e,0,0), dist),
-        sdfScene(p + vec3(0,e,0), dist) - sdfScene(p - vec3(0,e,0), dist),
-        sdfScene(p + vec3(0,0,e), dist) - sdfScene(p - vec3(0,0,e), dist)
-    ));
+  float e = 0.1;
+  return normalize(vec3(
+    sdfScene(p + vec3(e,0,0), dist) - sdfScene(p - vec3(e,0,0), dist),
+    sdfScene(p + vec3(0,e,0), dist) - sdfScene(p - vec3(0,e,0), dist),
+    sdfScene(p + vec3(0,0,e), dist) - sdfScene(p - vec3(0,0,e), dist)
+  ));
 }
 
-// ─── Adaptive normal: central-diff near splashes, analytical far ───
 vec3 getHitNormal(vec3 p, float dist) {
-    float splashDist = sdfSplashVolume(p, uTime);
-    if (splashDist < 1.5) {
-        return calcNormal3D(p, dist);
-    }
-    return oceanNormal(p.xz, uTime);
+  float particleDist = sdfMpmParticles(p);
+  if (particleDist < 1.5) {
+    return calcNormal3D(p, dist);
+  }
+  return oceanNormal(p.xz, uTime);
 }
 
-// ─── Procedural sky ───
+// ─── Sky ───
 vec3 getSunDir() {
   return normalize(vec3(0.8, max(0.05, uSunHeight), -0.6));
 }
@@ -448,23 +362,16 @@ vec3 getSunDir() {
 vec3 sky(vec3 rd) {
   vec3 sunDir = getSunDir();
   float sunDot = max(0.0, dot(rd, sunDir));
-
   float g = max(0.0, rd.y);
   vec3 zenith = vec3(0.12, 0.28, 0.58);
   vec3 horizon = vec3(0.55, 0.65, 0.78);
-
   float sunElev = sunDir.y;
   vec3 warmHorizon = mix(vec3(0.8, 0.45, 0.2), horizon, smoothstep(0.0, 0.5, sunElev));
   vec3 col = mix(warmHorizon, zenith, pow(g, 0.45));
-
-  if (rd.y < 0.0) {
-    col = mix(warmHorizon * 0.3, col, exp(rd.y * 8.0));
-  }
-
+  if (rd.y < 0.0) col = mix(warmHorizon * 0.3, col, exp(rd.y * 8.0));
   col += vec3(1.0, 0.95, 0.85) * pow(sunDot, 700.0) * 6.0;
   col += vec3(1.0, 0.85, 0.6) * pow(sunDot, 40.0) * 0.5;
   col += vec3(1.0, 0.7, 0.4) * pow(sunDot, 8.0) * 0.15;
-
   return col;
 }
 
@@ -479,7 +386,7 @@ float caustics(vec3 p) {
   return c * c;
 }
 
-// ─── Noise for turbulence ───
+// ─── Noise ───
 float hash31(vec3 p) {
   p = fract(p * vec3(443.897, 441.423, 437.195));
   p += dot(p, p.yzx + 19.19);
@@ -487,8 +394,7 @@ float hash31(vec3 p) {
 }
 
 float noise3(vec3 p) {
-  vec3 i = floor(p);
-  vec3 f = fract(p);
+  vec3 i = floor(p); vec3 f = fract(p);
   f = f * f * (3.0 - 2.0 * f);
   return mix(
     mix(mix(hash31(i), hash31(i+vec3(1,0,0)), f.x),
@@ -500,52 +406,29 @@ float noise3(vec3 p) {
 }
 
 float turbulenceField(vec3 p) {
-  float t = 0.0;
-  float a = 1.0, f = 0.3;
-  for (int i = 0; i < 4; i++) {
-    t += a * noise3(p * f + uTime * 0.25);
-    a *= 0.5; f *= 2.0;
-  }
+  float t = 0.0, a = 1.0, f = 0.3;
+  for (int i = 0; i < 4; i++) { t += a * noise3(p * f + uTime * 0.25); a *= 0.5; f *= 2.0; }
   return t;
 }
 
-// ─── Fresnel (Schlick) ───
 float fresnel(float cosT) {
   return 0.02 + 0.98 * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
-}
-
-// ─── SDF Visualization color map ───
-vec3 sdfColorMap(float d) {
-  // Negative (inside water) = blues/cyans, positive (above) = warm
-  if (d < 0.0) {
-    float t = clamp(-d * 0.3, 0.0, 1.0);
-    return mix(vec3(0.1, 0.6, 0.8), vec3(0.0, 0.05, 0.3), t);
-  } else {
-    float t = clamp(d * 0.3, 0.0, 1.0);
-    return mix(vec3(0.1, 0.8, 0.3), vec3(1.0, 0.3, 0.05), t);
-  }
 }
 
 // ─── Adaptive raymarch ───
 float raymarch(vec3 ro, vec3 rd) {
   float t = 0.1;
-  float lastD = 100.0;
-  float lastT = 0.0;
+  float lastD = 100.0, lastT = 0.0;
 
   for (int i = 0; i < MAX_STEPS; i++) {
     vec3 p = ro + rd * t;
     float d = sdfScene(p, t);
-
     if (d < 0.005) {
       t = lastT + (t - lastT) * lastD / (lastD - d + 0.0001);
       break;
     }
-
-    lastD = d;
-    lastT = t;
-
+    lastD = d; lastT = t;
     t += max(d * 0.45, 0.08 + t * 0.0025);
-
     if (t > MAX_DIST) break;
   }
   return t;
@@ -561,67 +444,71 @@ void main() {
 
   vec3 ro = uCamPos;
   vec3 rd = normalize(worldFar.xyz - worldNear.xyz);
-
   vec3 sunDir = getSunDir();
-
   float camH = oceanHeightFull(ro.xz, uTime);
   bool underwater = ro.y < camH;
 
-  // ─── SDF Visualization Mode ───
+  // ─── SDF Visualization Mode: Polarized Energy Heatmap ───
   if (uVizMode == 1) {
-    // Raymarch to find the surface like normal mode
     float tHit = raymarch(ro, rd);
     vec3 color;
-    
+
     if (tHit < MAX_DIST) {
       vec3 p = ro + rd * tHit;
       vec3 n = getHitNormal(p, tHit);
-      float d = sdfScene(p, tHit);
-      
-      // Base: color by surface height
+
+      // Base height coloring
       float h = oceanHeightFull(p.xz, uTime);
       float hNorm = clamp(h * 0.15 + 0.5, 0.0, 1.0);
-      vec3 lowCol = vec3(0.05, 0.15, 0.6);  // deep blue for troughs
-      vec3 midCol = vec3(0.1, 0.5, 0.4);    // teal for mid
-      vec3 highCol = vec3(0.9, 0.95, 1.0);  // white for crests
-      color = hNorm < 0.5 
-        ? mix(lowCol, midCol, hNorm * 2.0)
-        : mix(midCol, highCol, (hNorm - 0.5) * 2.0);
-      
-      // Iso-lines at height intervals  
+      vec3 lowCol = vec3(0.05, 0.12, 0.5);
+      vec3 midCol = vec3(0.08, 0.4, 0.35);
+      vec3 highCol = vec3(0.85, 0.9, 1.0);
+      color = hNorm < 0.5 ? mix(lowCol, midCol, hNorm * 2.0) : mix(midCol, highCol, (hNorm - 0.5) * 2.0);
+
+      // ─── Polarized Energy Heatmap Overlay ───
+      float R = rupturePotential(p.xz, uTime);
+      vec2 U = surfaceMomentum(p.xz, uTime);
+      float Umag = length(U);
+
+      // Rupture potential: blue → cyan → yellow → red → white
+      vec3 heatCol;
+      if (R < 0.25) heatCol = mix(vec3(0.0, 0.0, 0.3), vec3(0.0, 0.5, 0.7), R * 4.0);
+      else if (R < 0.5) heatCol = mix(vec3(0.0, 0.5, 0.7), vec3(0.8, 0.8, 0.0), (R - 0.25) * 4.0);
+      else if (R < 0.75) heatCol = mix(vec3(0.8, 0.8, 0.0), vec3(1.0, 0.2, 0.0), (R - 0.5) * 4.0);
+      else heatCol = mix(vec3(1.0, 0.2, 0.0), vec3(1.0, 1.0, 1.0), (R - 0.75) * 4.0);
+
+      color = mix(color, heatCol, smoothstep(0.05, 0.3, R) * 0.7);
+
+      // Surface momentum direction arrows (via pattern)
+      if (Umag > 0.5) {
+        vec2 Udir = U / Umag;
+        float arrow = dot(normalize(p.xz), Udir);
+        float arrowPattern = smoothstep(0.8, 1.0, abs(fract(dot(p.xz, Udir) * 0.3) - 0.5) * 2.0);
+        color += vec3(0.0, 0.6, 1.0) * arrowPattern * smoothstep(0.5, 3.0, Umag) * 0.3;
+      }
+
+      // MLS-MPM particle proximity glow
+      float pDist = sdfMpmParticles(p);
+      if (pDist < 2.0) {
+        float glow = 1.0 - smoothstep(0.0, 2.0, pDist);
+        color = mix(color, vec3(1.0, 0.5, 0.0), glow * 0.6);
+      }
+
+      // Iso-lines
       float isoLine = 1.0 - smoothstep(0.0, 0.06, abs(fract(h * 0.5) - 0.5) * 2.0);
-      color = mix(color, vec3(1.0), isoLine * 0.5);
-      
-      // Foam / Jacobian overlay
-      float foam = oceanFoam(p.xz, uTime);
-      color = mix(color, vec3(1.0, 0.3, 0.1), foam * 0.6);
-      
-      // LOD boundary rings (distance from camera)
-      float distToCam = length(p.xz - ro.xz);
-      float lod1 = 1.0 - smoothstep(0.0, 2.0, abs(distToCam - 50.0));
-      float lod2 = 1.0 - smoothstep(0.0, 3.0, abs(distToCam - 120.0));
-      color = mix(color, vec3(1.0, 0.2, 0.2), lod1 * 0.5);
-      color = mix(color, vec3(0.2, 0.4, 1.0), lod2 * 0.5);
-      
-      // Wireframe-style normal shading
-      float NdotL = max(0.0, dot(n, getSunDir()));
+      color = mix(color, vec3(1.0), isoLine * 0.3);
+
+      // Lighting
+      float NdotL = max(0.0, dot(n, sunDir));
       color *= 0.4 + 0.6 * NdotL;
-      
-      // Distance fog
+
+      // Fog
       float fog = 1.0 - exp(-tHit * 0.006);
-      color = mix(color, vec3(0.15, 0.18, 0.25), fog);
+      color = mix(color, vec3(0.12, 0.15, 0.22), fog);
     } else {
-      // Sky with dark tint for diagnostic look
       color = sky(rd) * 0.5;
     }
-    
-    // Grid overlay
-    vec2 screenUV = vUv;
-    float grid = 0.0;
-    grid += smoothstep(0.002, 0.0, abs(fract(screenUV.x * 20.0) - 0.5) - 0.49);
-    grid += smoothstep(0.002, 0.0, abs(fract(screenUV.y * 20.0) - 0.5) - 0.49);
-    color = mix(color, vec3(0.3, 0.4, 0.5), grid * 0.1);
-    
+
     color = pow(clamp(color, 0.0, 1.0), vec3(0.4545));
     gl_FragColor = vec4(color, 1.0);
     return;
@@ -638,12 +525,10 @@ void main() {
 
     vec3 v = -rd;
     float NdotV = max(0.001, dot(n, v));
-
     float F = fresnel(NdotV);
 
     vec3 reflDir = reflect(rd, n);
     vec3 refl = sky(reflDir);
-
     vec3 halfV = normalize(sunDir + v);
     float NdotH = max(0.0, dot(n, halfV));
     refl += vec3(1.0, 0.95, 0.85) * pow(NdotH, 350.0) * 4.0;
@@ -669,6 +554,22 @@ void main() {
     }
 
     float foam = oceanFoam(p.xz, uTime);
+
+    // ─── MLS-MPM particle regime shading ───
+    float pDist = sdfMpmParticles(p);
+    float particleInfluence = 1.0 - smoothstep(0.0, 1.0, pDist);
+
+    if (particleInfluence > 0.01) {
+      // Particle-dominated shading: whiter, more reflective (spray/sheet appearance)
+      vec3 sprayCol = mix(waterCol, vec3(0.75, 0.82, 0.88), particleInfluence * 0.6);
+      // Thin sheet/film scattering
+      float thinFilm = exp(-max(0.0, pDist) * 3.0) * 0.3;
+      sprayCol += vec3(0.15, 0.2, 0.22) * thinFilm;
+      // Enhanced foam where particles meet ocean surface
+      foam = max(foam, particleInfluence * 0.6 * exp(-pDist * 2.0));
+      waterCol = sprayCol;
+    }
+
     vec3 foamCol = vec3(0.82, 0.88, 0.93) * foam;
 
     if (underwater) {
@@ -681,7 +582,6 @@ void main() {
     float fog = 1.0 - exp(-t * 0.0035);
     vec3 fogCol = sky(rd) * 0.65;
     color = mix(color, fogCol, fog);
-
   } else {
     color = sky(rd);
   }
@@ -702,7 +602,7 @@ void main() {
 }
 `;
 
-// ─── R3F Scene Component ───
+// ─── R3F Scene Components ───
 
 export interface SDFWaterParams {
   waveScale: number;
@@ -729,55 +629,152 @@ const DEFAULT_PARAMS: SDFWaterParams = {
   turbulence: 0.3,
 };
 
+/**
+ * Evaluate Gerstner height on CPU (mirrors shader oceanHeightFull).
+ * Used by MLS-MPM solver for reabsorption checks.
+ */
+function cpuOceanHeight(x: number, z: number, time: number, params: SDFWaterParams): number {
+  const s = params.waveScale;
+  const ts = time * params.timeScale;
+  const TAU = Math.PI * 2;
+
+  const gW = (px: number, pz: number, t: number, A: number, wl: number, dx: number, dz: number, spd: number, ph: number) => {
+    const k = TAU / wl;
+    return A * Math.cos(k * (dx * px + dz * pz) - k * spd * t + ph);
+  };
+
+  let h = 0;
+  h += gW(x, z, ts, 1.2 * s, 60, 0.8, 0.6, 8, 0);
+  h += gW(x, z, ts, 0.9 * s, 42, -0.447, 0.894, 6.5, 1.5);
+  h += gW(x, z, ts, 0.8 * s, 80, 0, 1, 10, 4);
+  h += gW(x, z, ts, 0.6 * s, 26, 0.3, -0.95, 5.2, 0.7);
+  h += gW(x, z, ts, 0.4 * s, 16, -0.9, -0.44, 4, 2.1);
+  h += gW(x, z, ts, 0.3 * s, 13, 0.95, -0.3, 3.5, 1.8);
+  h += gW(x, z, ts, 0.25 * s, 8.5, 0.6, -0.8, 3.2, 3.3);
+  h += gW(x, z, ts, 0.15 * s, 5.5, -0.7, 0.7, 2.5, 5.2);
+  return h;
+}
+
+/**
+ * Compute rupture potential on CPU (mirrors shader rupturePotential).
+ * Used for auto-spawning particles at high-energy wave points.
+ */
+function cpuRupturePotential(x: number, z: number, time: number, params: SDFWaterParams): number {
+  const s = params.waveScale;
+  const ts = time * params.timeScale;
+  const c = params.choppiness;
+  const TAU = Math.PI * 2;
+
+  const gJ = (px: number, pz: number, t: number, A: number, wl: number, dx: number, dz: number, spd: number, ph: number, st: number) => {
+    const k = TAU / wl;
+    return st * A * k * Math.cos(k * (dx * px + dz * pz) - k * spd * t + ph);
+  };
+
+  let j = 1;
+  j -= gJ(x, z, ts, 1.2 * s, 60, 0.8, 0.6, 8, 0, 0.4 * c);
+  j -= gJ(x, z, ts, 0.9 * s, 42, -0.447, 0.894, 6.5, 1.5, 0.35 * c);
+  j -= gJ(x, z, ts, 0.6 * s, 26, 0.3, -0.95, 5.2, 0.7, 0.5 * c);
+  j -= gJ(x, z, ts, 0.4 * s, 16, -0.9, -0.44, 4, 2.1, 0.45 * c);
+  const folding = j < 0 ? Math.min(1, -j / 0.4) : 0;
+
+  const gG = (px: number, pz: number, t: number, A: number, wl: number, dx: number, dz: number, spd: number, ph: number) => {
+    const k = TAU / wl;
+    const val = -A * k * Math.sin(k * (dx * px + dz * pz) - k * spd * t + ph);
+    return [val * dx, val * dz] as [number, number];
+  };
+
+  let gx = 0, gz = 0;
+  const g1 = gG(x, z, ts, 1.2 * s, 60, 0.8, 0.6, 8, 0);
+  const g2 = gG(x, z, ts, 0.9 * s, 42, -0.447, 0.894, 6.5, 1.5);
+  const g3 = gG(x, z, ts, 0.6 * s, 26, 0.3, -0.95, 5.2, 0.7);
+  gx = g1[0] + g2[0] + g3[0]; gz = g1[1] + g2[1] + g3[1];
+  const slope = Math.sqrt(gx * gx + gz * gz);
+
+  return folding * 0.4 + slope * 0.25;
+}
+
+/**
+ * CPU surface momentum direction for particle launch orientation.
+ */
+function cpuSurfaceMomentum(x: number, z: number, time: number, params: SDFWaterParams): [number, number] {
+  const s = params.waveScale;
+  const ts = time * params.timeScale;
+  const TAU = Math.PI * 2;
+
+  const gG = (px: number, pz: number, t: number, A: number, wl: number, dx: number, dz: number, spd: number, ph: number) => {
+    const k = TAU / wl;
+    const val = -A * k * Math.sin(k * (dx * px + dz * pz) - k * spd * t + ph);
+    return [val * dx * spd, val * dz * spd] as [number, number];
+  };
+
+  let ux = 0, uz = 0;
+  const pairs: [number, number, number, number, number][] = [
+    [1.2 * s, 60, 0.8, 0.6, 8],
+    [0.9 * s, 42, -0.447, 0.894, 6.5],
+    [0.6 * s, 26, 0.3, -0.95, 5.2],
+  ];
+  for (const [A, wl, dx, dz, spd] of pairs) {
+    const g = gG(x, z, ts, A, wl, dx, dz, spd, 0);
+    ux += g[0]; uz += g[1];
+  }
+  return [ux, uz];
+}
+
+// ─── Click Plane ───
+
 function ClickPlane({ onClickOcean }: { onClickOcean: (x: number, z: number) => void }) {
   const handleClick = useCallback(
     (e: ThreeEvent<MouseEvent>) => {
       e.stopPropagation();
-      if (e.point) {
-        onClickOcean(e.point.x, e.point.z);
-      }
+      if (e.point) onClickOcean(e.point.x, e.point.z);
     },
     [onClickOcean]
   );
 
   return (
-    <mesh
-      rotation={[-Math.PI / 2, 0, 0]}
-      position={[0, 0, 0]}
-      onClick={handleClick}
-      visible={false}
-    >
+    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0, 0]} onClick={handleClick} visible={false}>
       <planeGeometry args={[500, 500]} />
       <meshBasicMaterial />
     </mesh>
   );
 }
 
+// ─── Ocean Shader with MLS-MPM Integration ───
+
 function OceanShader({
   params,
   splashes,
   vizMode,
+  mpmSolver,
 }: {
   params: SDFWaterParams;
   splashes: SplashData[];
   vizMode: number;
+  mpmSolver: MLSMPMSolver;
 }) {
   const ref = useRef<THREE.ShaderMaterial>(null);
   const { camera, gl } = useThree();
   const invPV = useMemo(() => new THREE.Matrix4(), []);
 
-  // Build splash uniform array
-  const splashArray = useMemo(() => {
-    const arr: number[] = [];
-    for (let i = 0; i < MAX_SPLASHES; i++) {
-      if (i < splashes.length) {
-        arr.push(splashes[i].x, splashes[i].z, splashes[i].time, splashes[i].amplitude);
-      } else {
-        arr.push(0, 0, -100, 0);
-      }
-    }
-    return arr;
-  }, [splashes]);
+  // MLS-MPM DataTexture: width=MAX_PARTICLES, height=3, RGBA float
+  const mpmTexData = useRef(new Float32Array(MAX_PARTICLES * 3 * 4));
+  const mpmTex = useMemo(() => {
+    const tex = new THREE.DataTexture(
+      mpmTexData.current,
+      MAX_PARTICLES,
+      3,
+      THREE.RGBAFormat,
+      THREE.FloatType
+    );
+    tex.minFilter = THREE.NearestFilter;
+    tex.magFilter = THREE.NearestFilter;
+    tex.needsUpdate = true;
+    return tex;
+  }, []);
+
+  // Auto-spawn tracking
+  const lastAutoSpawn = useRef(0);
+  const autoSpawnCooldown = 0.5; // seconds between auto-spawn checks
 
   const uniforms = useMemo(
     () => ({
@@ -793,6 +790,10 @@ function OceanShader({
       uTurbulence: { value: params.turbulence },
       uSplashes: { value: [] as THREE.Vector4[] },
       uSplashCount: { value: 0 },
+      uMpmTex: { value: mpmTex },
+      uMpmCount: { value: 0 },
+      uMpmBoundsMin: { value: new THREE.Vector3() },
+      uMpmBoundsMax: { value: new THREE.Vector3() },
       uVizMode: { value: 0 },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -803,16 +804,63 @@ function OceanShader({
     const mat = ref.current;
     if (!mat) return;
 
-    mat.uniforms.uTime.value = clock.elapsedTime;
+    const elapsed = clock.elapsedTime;
+    const dt = clock.getDelta();
+
+    // ═══ MLS-MPM Step ═══
+    // Provide ocean height callback for reabsorption
+    const heightAt = (x: number, z: number) => cpuOceanHeight(x, z, elapsed, params);
+    
+    // Sub-step for stability (2 sub-steps)
+    const subDt = Math.min(dt, 0.016) / 2;
+    for (let s = 0; s < 2; s++) {
+      mpmSolver.step(subDt, heightAt);
+    }
+
+    // ═══ Auto-spawn from wave energy ═══
+    if (elapsed - lastAutoSpawn.current > autoSpawnCooldown && mpmSolver.count < MAX_PARTICLES - 50) {
+      lastAutoSpawn.current = elapsed;
+      
+      // Sample rupture potential at several points around the camera
+      const camX = camera.position.x;
+      const camZ = camera.position.z;
+      const sampleRadius = 15;
+      
+      for (let si = 0; si < 6; si++) {
+        const angle = (si / 6) * Math.PI * 2 + elapsed * 0.1;
+        const sx = camX + Math.cos(angle) * sampleRadius * (0.5 + Math.random() * 0.5);
+        const sz = camZ + Math.sin(angle) * sampleRadius * (0.5 + Math.random() * 0.5);
+        
+        const R = cpuRupturePotential(sx, sz, elapsed, params);
+        
+        if (R > 0.45) { // High energy threshold
+          const surfH = heightAt(sx, sz);
+          const [ux, uz] = cpuSurfaceMomentum(sx, sz, elapsed, params);
+          const umag = Math.sqrt(ux * ux + uz * uz);
+          const baseVel: [number, number, number] = umag > 0.5
+            ? [ux / umag * 2, 0, uz / umag * 2]
+            : [0, 0, 0];
+          
+          const spawnCount = Math.floor(8 + R * 20);
+          mpmSolver.spawn(sx, sz, surfH, spawnCount, baseVel, R * 2);
+        }
+      }
+    }
+
+    // ═══ Update DataTexture ═══
+    mpmSolver.buildTexData(mpmTexData.current);
+    mpmTex.image.data = mpmTexData.current;
+    mpmTex.needsUpdate = true;
+
+    // ═══ Update uniforms ═══
+    mat.uniforms.uTime.value = elapsed;
 
     const pr = gl.getPixelRatio();
     const canvas = gl.domElement;
     mat.uniforms.uResolution.value.set(canvas.width * pr, canvas.height * pr);
     mat.uniforms.uCamPos.value.copy(camera.position);
 
-    invPV
-      .multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
-      .invert();
+    invPV.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
     mat.uniforms.uInvProjView.value.copy(invPV);
 
     mat.uniforms.uWaveScale.value = params.waveScale;
@@ -823,13 +871,15 @@ function OceanShader({
     mat.uniforms.uTurbulence.value = params.turbulence;
     mat.uniforms.uVizMode.value = vizMode;
 
-    // Update splash uniforms
+    mat.uniforms.uMpmCount.value = Math.min(mpmSolver.count, MAX_MPM_SHADER);
+    mat.uniforms.uMpmBoundsMin.value.set(...(mpmSolver.boundsMin as [number, number, number]));
+    mat.uniforms.uMpmBoundsMax.value.set(...(mpmSolver.boundsMax as [number, number, number]));
+
+    // Splash uniforms
     const splashVecs: THREE.Vector4[] = [];
     for (let i = 0; i < MAX_SPLASHES; i++) {
       if (i < splashes.length) {
-        splashVecs.push(
-          new THREE.Vector4(splashes[i].x, splashes[i].z, splashes[i].time, splashes[i].amplitude)
-        );
+        splashVecs.push(new THREE.Vector4(splashes[i].x, splashes[i].z, splashes[i].time, splashes[i].amplitude));
       } else {
         splashVecs.push(new THREE.Vector4(0, 0, -100, 0));
       }
@@ -853,6 +903,8 @@ function OceanShader({
   );
 }
 
+// ─── Main Scene ───
+
 export default function SDFWaterScene({
   params = DEFAULT_PARAMS,
   splashes = [],
@@ -864,11 +916,27 @@ export default function SDFWaterScene({
   vizMode?: number;
   onClickOcean?: (x: number, z: number) => void;
 }) {
+  // Single MLS-MPM solver instance, persists across renders
+  const mpmSolver = useMemo(() => new MLSMPMSolver(), []);
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
+
   const handleClick = useCallback(
     (x: number, z: number) => {
       onClickOcean?.(x, z);
+
+      // Spawn MLS-MPM particles at click location
+      const elapsed = performance.now() / 1000;
+      const surfH = cpuOceanHeight(x, z, elapsed, paramsRef.current);
+      const [ux, uz] = cpuSurfaceMomentum(x, z, elapsed, paramsRef.current);
+      const umag = Math.sqrt(ux * ux + uz * uz);
+      const baseVel: [number, number, number] = umag > 0.5
+        ? [ux / umag * 3, 0, uz / umag * 3]
+        : [0, 0, 0];
+
+      mpmSolver.spawn(x, z, surfH, 60, baseVel, 2.5);
     },
-    [onClickOcean]
+    [onClickOcean, mpmSolver]
   );
 
   return (
@@ -881,6 +949,7 @@ export default function SDFWaterScene({
         params={params}
         splashes={splashes}
         vizMode={vizMode}
+        mpmSolver={mpmSolver}
       />
       <ClickPlane onClickOcean={handleClick} />
       <OrbitControls
