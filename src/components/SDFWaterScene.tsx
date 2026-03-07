@@ -774,7 +774,7 @@ function OceanShader({
 
   // Auto-spawn tracking
   const lastAutoSpawn = useRef(0);
-  const autoSpawnCooldown = 0.5; // seconds between auto-spawn checks
+  const autoSpawnCooldown = 0.25; // seconds between auto-spawn checks — frequent for organic feel
 
   const uniforms = useMemo(
     () => ({
