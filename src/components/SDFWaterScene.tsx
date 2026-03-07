@@ -143,7 +143,7 @@ float sdfMpmParticles(vec3 p) {
   for (int i = 0; i < ${MAX_MPM_SHADER}; i++) {
     if (i >= count) break;
 
-    // texelFetch from DataTexture (width=512, height=3)
+    // texelFetch from DataTexture (width=MAX_PARTICLES, height=3)
     vec4 posR = texelFetch(uMpmTex, ivec2(i, 0), 0);
     vec4 velD = texelFetch(uMpmTex, ivec2(i, 1), 0);
     vec4 meta = texelFetch(uMpmTex, ivec2(i, 2), 0);
