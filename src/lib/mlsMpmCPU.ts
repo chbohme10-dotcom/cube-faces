@@ -7,31 +7,28 @@
  * - Equation-of-state pressure model
  * - Viscosity via strain rate tensor
  * - Gravity and boundary enforcement
- * - Particle spawning, aging, reabsorption, compaction
+ * - Particle aging, reabsorption, compaction
  * - Density-based regime classification (sheet/filament/droplet)
  *
  * Reference: Hu et al. "A Moving Least Squares Material Point Method" (2018)
  */
 
-// Grid dimensions (cells)
-const GW = 48, GH = 40, GD = 48;
+// Grid dimensions (cells) — large enough to cover visible ocean area
+const GW = 128, GH = 48, GD = 128;
 const CELL_SIZE = 0.5; // world units per cell
 const INV_CELL = 1.0 / CELL_SIZE;
 
 // Domain origin in world space (grid cell 0,0,0 maps here)
-const ORIGIN_X = -12, ORIGIN_Y = -6, ORIGIN_Z = -12;
+// Covers world space [-32, 32] x [-6, 18] x [-32, 32]
+const ORIGIN_X = -32, ORIGIN_Y = -6, ORIGIN_Z = -32;
 
 // Solver constants
-const MAX_PARTICLES = 512;
-const GRAVITY = -14.0;
-const REST_DENSITY = 4.0;
-const STIFFNESS = 40.0;
-const VISCOSITY = 0.15;
-const MAX_AGE = 8.0;
-
-// Regime thresholds (density-based)
-const SHEET_DENSITY = REST_DENSITY * 0.7;
-const FILAMENT_DENSITY = REST_DENSITY * 0.25;
+const MAX_PARTICLES = 1024;
+const GRAVITY = -9.8;
+const REST_DENSITY = 3.0;
+const STIFFNESS = 30.0;
+const VISCOSITY = 0.12;
+const MAX_AGE = 6.0;
 
 export { MAX_PARTICLES };
 
@@ -89,33 +86,69 @@ export class MLSMPMSolver {
   }
 
   /**
-   * Spawn particles at a world position with initial velocity.
-   * Creates a cone of particles above the surface for organic splash shape.
+   * Spawn particles organically from wave surface.
+   * Places particles in a thin sheet along the surface with inherited wave momentum.
+   * NOT an explosion — particles conform to the surface and inherit its velocity.
+   * 
+   * @param wx World X of spawn center
+   * @param wz World Z of spawn center  
+   * @param surfaceH Ocean height at spawn point
+   * @param count Number of particles to spawn
+   * @param surfaceVel Wave surface momentum [vx, vy, vz] — inherited from wave gradients
+   * @param rupture Rupture potential (0-1+) — controls upward lift and spread
+   * @param oceanHeightAt Callback to get ocean height at any point
    */
-  spawn(
+  spawnFromSurface(
     wx: number, wz: number,
     surfaceH: number,
     count: number,
-    baseVel: [number, number, number],
-    amplitude = 2.5,
+    surfaceVel: [number, number, number],
+    rupture: number,
+    oceanHeightAt?: (x: number, z: number) => number,
   ) {
+    // Clamp spawn to grid interior
+    const [gx, , gz] = this.w2g(wx, 0, wz);
+    if (gx < 4 || gx >= GW - 4 || gz < 4 || gz >= GD - 4) return;
+
+    const spreadRadius = 1.0 + rupture * 2.0; // How wide the spawn patch is
+    const surfNormalLift = rupture * 3.0; // Upward velocity from rupture severity
+    
     for (let i = 0; i < count && this.count < MAX_PARTICLES; i++) {
       const idx = this.count;
+      
+      // Place in a thin disc on the surface
       const angle = Math.random() * Math.PI * 2;
-      const r = Math.random() * amplitude * 0.6;
-      const upJitter = Math.random();
+      const r = Math.random() * spreadRadius;
+      const spx = wx + Math.cos(angle) * r;
+      const spz = wz + Math.sin(angle) * r;
+      
+      // Get actual ocean height at this offset position
+      const localH = oceanHeightAt 
+        ? oceanHeightAt(spx, spz) 
+        : surfaceH;
+      
+      // Place slightly above surface (thin sheet)
+      this.px[idx] = spx;
+      this.py[idx] = localH + 0.05 + Math.random() * 0.15;
+      this.pz[idx] = spz;
 
-      this.px[idx] = wx + Math.cos(angle) * r;
-      this.py[idx] = surfaceH + upJitter * 0.3;
-      this.pz[idx] = wz + Math.sin(angle) * r;
+      // Velocity: inherit surface momentum + controlled upward lift from rupture
+      // Forward throw from wave momentum (the key insight from the docs)
+      const jitter = 0.3;
+      this.vx[idx] = surfaceVel[0] + (Math.random() - 0.5) * jitter;
+      this.vy[idx] = surfaceVel[1] + surfNormalLift * (0.5 + Math.random() * 0.5);
+      this.vz[idx] = surfaceVel[2] + (Math.random() - 0.5) * jitter;
 
-      // Initial velocity: upward thrust + outward spread + inherited surface momentum
-      const outSpeed = (1.5 + Math.random() * 3.0) * amplitude;
-      const upSpeed = (4.0 + Math.random() * 6.0) * amplitude;
-
-      this.vx[idx] = baseVel[0] + Math.cos(angle) * outSpeed;
-      this.vy[idx] = upSpeed;
-      this.vz[idx] = baseVel[2] + Math.sin(angle) * outSpeed;
+      // Lateral spread along crest tangent (perpendicular to momentum)
+      const umag = Math.sqrt(surfaceVel[0] ** 2 + surfaceVel[2] ** 2);
+      if (umag > 0.1) {
+        // Tangent perpendicular to momentum direction
+        const tx = -surfaceVel[2] / umag;
+        const tz = surfaceVel[0] / umag;
+        const lateralSpread = (Math.random() - 0.5) * rupture * 1.5;
+        this.vx[idx] += tx * lateralSpread;
+        this.vz[idx] += tz * lateralSpread;
+      }
 
       this.C.fill(0, idx * 9, idx * 9 + 9);
       this.mass[idx] = 1.0;
@@ -132,7 +165,7 @@ export class MLSMPMSolver {
   step(dt: number, oceanHeightAt?: (x: number, z: number) => number) {
     if (this.count === 0) return;
 
-    const clamped_dt = Math.min(dt, 0.008); // stability cap
+    const clamped_dt = Math.min(dt, 0.006); // stability cap
 
     // ═══ Clear grid ═══
     this.gMass.fill(0);
@@ -146,6 +179,13 @@ export class MLSMPMSolver {
 
       const [gx, gy, gz] = this.w2g(this.px[i], this.py[i], this.pz[i]);
       const cx = Math.floor(gx), cy = Math.floor(gy), cz = Math.floor(gz);
+      
+      // Bounds check
+      if (cx < 1 || cx >= GW - 2 || cy < 1 || cy >= GH - 2 || cz < 1 || cz >= GD - 2) {
+        this.alive[i] = 0;
+        continue;
+      }
+      
       const dx = gx - (cx + 0.5), dy = gy - (cy + 0.5), dz = gz - (cz + 0.5);
 
       // Quadratic B-spline weights
@@ -188,6 +228,8 @@ export class MLSMPMSolver {
 
       const [gx, gy, gz] = this.w2g(this.px[i], this.py[i], this.pz[i]);
       const cx = Math.floor(gx), cy = Math.floor(gy), cz = Math.floor(gz);
+      if (cx < 1 || cx >= GW - 2 || cy < 1 || cy >= GH - 2 || cz < 1 || cz >= GD - 2) continue;
+      
       const dx = gx - (cx + 0.5), dy = gy - (cy + 0.5), dz = gz - (cz + 0.5);
       const wxArr = [0.5 * (0.5 - dx) * (0.5 - dx), 0.75 - dx * dx, 0.5 * (0.5 + dx) * (0.5 + dx)];
       const wyArr = [0.5 * (0.5 - dy) * (0.5 - dy), 0.75 - dy * dy, 0.5 * (0.5 + dy) * (0.5 + dy)];
@@ -248,10 +290,10 @@ export class MLSMPMSolver {
       const iz = g % GD;
       const iy = ((g / GD) | 0) % GH;
       const ix = ((g / (GD * GH)) | 0);
-      if (ix < 2 || ix >= GW - 2) this.gVx[g] = 0;
-      if (iy < 2) this.gVy[g] = Math.max(0, this.gVy[g]);
-      if (iy >= GH - 2) this.gVy[g] = Math.min(0, this.gVy[g]);
-      if (iz < 2 || iz >= GD - 2) this.gVz[g] = 0;
+      if (ix < 3 || ix >= GW - 3) this.gVx[g] = 0;
+      if (iy < 3) this.gVy[g] = Math.max(0, this.gVy[g]);
+      if (iy >= GH - 3) this.gVy[g] = Math.min(0, this.gVy[g]);
+      if (iz < 3 || iz >= GD - 3) this.gVz[g] = 0;
     }
 
     // ═══ G2P: gather velocity + APIC B matrix, advect ═══
@@ -263,6 +305,11 @@ export class MLSMPMSolver {
 
       const [gx, gy, gz] = this.w2g(this.px[i], this.py[i], this.pz[i]);
       const cx = Math.floor(gx), cy = Math.floor(gy), cz = Math.floor(gz);
+      if (cx < 1 || cx >= GW - 2 || cy < 1 || cy >= GH - 2 || cz < 1 || cz >= GD - 2) {
+        this.alive[i] = 0;
+        continue;
+      }
+      
       const dx = gx - (cx + 0.5), dy = gy - (cy + 0.5), dz = gz - (cz + 0.5);
       const wxArr = [0.5 * (0.5 - dx) * (0.5 - dx), 0.75 - dx * dx, 0.5 * (0.5 + dx) * (0.5 + dx)];
       const wyArr = [0.5 * (0.5 - dy) * (0.5 - dy), 0.75 - dy * dy, 0.5 * (0.5 + dy) * (0.5 + dy)];
@@ -285,7 +332,7 @@ export class MLSMPMSolver {
 
             // APIC B matrix: B = Σ w_ip * v_i * (x_i - x_p)^T
             const cdx = (ix + 0.5) - gx, cdy = (iy + 0.5) - gy, cdz = (iz + 0.5) - gz;
-            const w4 = 4 * w; // Scale factor for B→C conversion
+            const w4 = 4 * w;
             this.C[Ci]     += w4 * gvx * cdx;
             this.C[Ci + 1] += w4 * gvx * cdy;
             this.C[Ci + 2] += w4 * gvx * cdz;
@@ -311,25 +358,19 @@ export class MLSMPMSolver {
 
       // Reabsorption: kill particles that fall below ocean surface or are too old
       let kill = this.age[i] > MAX_AGE;
-      
-      // Out of domain check
-      const [pgx, pgy, pgz] = this.w2g(this.px[i], this.py[i], this.pz[i]);
-      if (pgx < 1 || pgx >= GW - 1 || pgy < 1 || pgy >= GH - 1 || pgz < 1 || pgz >= GD - 1) {
-        kill = true;
-      }
 
-      // Reabsorption into ocean surface
-      if (oceanHeightAt && this.age[i] > 0.3) {
+      // Reabsorption into ocean surface — only after particle has had time to arc
+      if (oceanHeightAt && this.age[i] > 0.4) {
         const surfH = oceanHeightAt(this.px[i], this.pz[i]);
-        if (this.py[i] < surfH - 0.3) {
-          kill = true; // Reabsorbed into ocean
+        // Kill if below surface AND moving downward (re-entering the ocean)
+        if (this.py[i] < surfH - 0.1 && this.vy[i] < 0) {
+          kill = true;
         }
       }
 
       if (kill) {
         this.alive[i] = 0;
       } else {
-        // Update bounds
         if (this.px[i] < bMinX) bMinX = this.px[i];
         if (this.py[i] < bMinY) bMinY = this.py[i];
         if (this.pz[i] < bMinZ) bMinZ = this.pz[i];
@@ -342,7 +383,6 @@ export class MLSMPMSolver {
     this.boundsMin = [bMinX, bMinY, bMinZ];
     this.boundsMax = [bMaxX, bMaxY, bMaxZ];
 
-    // Compact dead particles
     this.compact();
   }
 
@@ -382,9 +422,8 @@ export class MLSMPMSolver {
       data[r0] = this.px[i];
       data[r0 + 1] = this.py[i];
       data[r0 + 2] = this.pz[i];
-      // Radius varies with density: dense = larger (sheet), sparse = smaller (droplet)
       const densRatio = this.density[i] / REST_DENSITY;
-      data[r0 + 3] = 0.25 + 0.3 * Math.min(1.0, densRatio);
+      data[r0 + 3] = 0.2 + 0.35 * Math.min(1.0, densRatio);
 
       // Row 1
       const r1 = MAX_PARTICLES * 4 + i * 4;
@@ -396,10 +435,8 @@ export class MLSMPMSolver {
       // Row 2: regime classification
       const r2 = MAX_PARTICLES * 4 * 2 + i * 4;
       data[r2] = this.age[i];
-      // Regime: 0=sheet (dense), 1=filament (medium), 2=droplet (sparse)
       const regime = densRatio > 0.7 ? 0.0 : densRatio > 0.25 ? 1.0 : 2.0;
       data[r2 + 1] = regime;
-      // Coherence: based on density and age
       data[r2 + 2] = Math.max(0, Math.min(1, densRatio * (1 - this.age[i] / MAX_AGE)));
       data[r2 + 3] = 0;
     }

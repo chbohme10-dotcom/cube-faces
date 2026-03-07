@@ -24,7 +24,7 @@ import * as THREE from "three";
 import { MLSMPMSolver, MAX_PARTICLES } from "@/lib/mlsMpmCPU";
 
 const MAX_SPLASHES = 8;
-const MAX_MPM_SHADER = 128; // Max particles queried per ray step
+const MAX_MPM_SHADER = 256; // Max particles queried per ray step
 
 // ─── Shader sources ───
 
@@ -143,7 +143,7 @@ float sdfMpmParticles(vec3 p) {
   for (int i = 0; i < ${MAX_MPM_SHADER}; i++) {
     if (i >= count) break;
 
-    // texelFetch from DataTexture (width=512, height=3)
+    // texelFetch from DataTexture (width=MAX_PARTICLES, height=3)
     vec4 posR = texelFetch(uMpmTex, ivec2(i, 0), 0);
     vec4 velD = texelFetch(uMpmTex, ivec2(i, 1), 0);
     vec4 meta = texelFetch(uMpmTex, ivec2(i, 2), 0);
@@ -659,7 +659,10 @@ function cpuOceanHeight(x: number, z: number, time: number, params: SDFWaterPara
  * Compute rupture potential on CPU (mirrors shader rupturePotential).
  * Used for auto-spawning particles at high-energy wave points.
  */
-function cpuRupturePotential(x: number, z: number, time: number, params: SDFWaterParams): number {
+function cpuRupturePotential(
+  x: number, z: number, time: number, params: SDFWaterParams,
+  splashes?: SplashData[]
+): number {
   const s = params.waveScale;
   const ts = time * params.timeScale;
   const c = params.choppiness;
@@ -690,7 +693,36 @@ function cpuRupturePotential(x: number, z: number, time: number, params: SDFWate
   gx = g1[0] + g2[0] + g3[0]; gz = g1[1] + g2[1] + g3[1];
   const slope = Math.sqrt(gx * gx + gz * gz);
 
-  return folding * 0.4 + slope * 0.25;
+  // Vertical velocity from wave motion (finite difference proxy)
+  const gW = (px: number, pz: number, t: number, A: number, wl: number, dx: number, dz: number, spd: number, ph: number) => {
+    const k = TAU / wl;
+    return A * Math.cos(k * (dx * px + dz * pz) - k * spd * t + ph);
+  };
+  const h0 = gW(x, z, ts, 1.2*s, 60, 0.8, 0.6, 8, 0)
+           + gW(x, z, ts, 0.9*s, 42, -0.447, 0.894, 6.5, 1.5)
+           + gW(x, z, ts, 0.8*s, 80, 0, 1, 10, 4);
+  const h1 = gW(x, z, ts - 0.04, 1.2*s, 60, 0.8, 0.6, 8, 0)
+           + gW(x, z, ts - 0.04, 0.9*s, 42, -0.447, 0.894, 6.5, 1.5)
+           + gW(x, z, ts - 0.04, 0.8*s, 80, 0, 1, 10, 4);
+  const vUp = Math.max(0, (h0 - h1) / 0.04);
+
+  // Splash ripple energy contribution — makes click-created waves organically trigger MPM
+  let splashEnergy = 0;
+  if (splashes) {
+    for (const sp of splashes) {
+      const age = time - sp.time;
+      if (age < 0 || age > 10) continue;
+      const dist = Math.sqrt((x - sp.x) ** 2 + (z - sp.z) ** 2);
+      const speed = 8.0;
+      const ringDist = Math.abs(dist - speed * age);
+      // Energy concentrated at the expanding ring front
+      const energy = sp.amplitude * Math.exp(-age * 0.4) * Math.exp(-ringDist * 0.8)
+        * (1 - Math.exp(-age * 3)); // ramp up
+      splashEnergy += energy;
+    }
+  }
+
+  return folding * 0.35 + slope * 0.2 + vUp * 0.3 + Math.min(1.0, splashEnergy) * 0.5;
 }
 
 /**
@@ -774,7 +806,7 @@ function OceanShader({
 
   // Auto-spawn tracking
   const lastAutoSpawn = useRef(0);
-  const autoSpawnCooldown = 0.5; // seconds between auto-spawn checks
+  const autoSpawnCooldown = 0.25; // seconds between auto-spawn checks — frequent for organic feel
 
   const uniforms = useMemo(
     () => ({
@@ -817,32 +849,43 @@ function OceanShader({
       mpmSolver.step(subDt, heightAt);
     }
 
-    // ═══ Auto-spawn from wave energy ═══
-    if (elapsed - lastAutoSpawn.current > autoSpawnCooldown && mpmSolver.count < MAX_PARTICLES - 50) {
+    // ═══ Auto-spawn from wave energy (the ONLY source of particles) ═══
+    // Per the docs: particles emerge organically from wave energy, not from clicks.
+    // The polarized heatmap detects high-energy crests and spawns surface-conforming sheets.
+    if (elapsed - lastAutoSpawn.current > autoSpawnCooldown && mpmSolver.count < MAX_PARTICLES - 80) {
       lastAutoSpawn.current = elapsed;
       
-      // Sample rupture potential at several points around the camera
-      const camX = camera.position.x;
-      const camZ = camera.position.z;
-      const sampleRadius = 15;
+      // Sample rupture potential across the visible ocean near origin
+      // Grid covers [-32,32] so sample within that
+      const sampleRange = 25;
       
-      for (let si = 0; si < 6; si++) {
-        const angle = (si / 6) * Math.PI * 2 + elapsed * 0.1;
-        const sx = camX + Math.cos(angle) * sampleRadius * (0.5 + Math.random() * 0.5);
-        const sz = camZ + Math.sin(angle) * sampleRadius * (0.5 + Math.random() * 0.5);
+      for (let si = 0; si < 12; si++) {
+        const angle = (si / 12) * Math.PI * 2 + elapsed * 0.15;
+        const radius = 3 + Math.random() * sampleRange;
+        const sx = Math.cos(angle) * radius;
+        const sz = Math.sin(angle) * radius;
         
-        const R = cpuRupturePotential(sx, sz, elapsed, params);
+        const R = cpuRupturePotential(sx, sz, elapsed, params, splashes);
         
-        if (R > 0.45) { // High energy threshold
+        if (R > 0.35) { // Rupture threshold
           const surfH = heightAt(sx, sz);
           const [ux, uz] = cpuSurfaceMomentum(sx, sz, elapsed, params);
           const umag = Math.sqrt(ux * ux + uz * uz);
-          const baseVel: [number, number, number] = umag > 0.5
-            ? [ux / umag * 2, 0, uz / umag * 2]
-            : [0, 0, 0];
           
-          const spawnCount = Math.floor(8 + R * 20);
-          mpmSolver.spawn(sx, sz, surfH, spawnCount, baseVel, R * 2);
+          // Vertical velocity estimate (finite difference)
+          const h0 = heightAt(sx, sz);
+          const h1 = cpuOceanHeight(sx, sz, elapsed - 0.03, params);
+          const vUp = Math.max(0, (h0 - h1) / 0.03);
+          
+          // Surface velocity: forward throw from wave momentum + upward from vertical motion
+          const surfVel: [number, number, number] = [
+            umag > 0.1 ? ux / umag * (1.0 + R) : 0,
+            vUp * (0.5 + R * 1.5),  // Controlled upward from actual surface velocity
+            umag > 0.1 ? uz / umag * (1.0 + R) : 0,
+          ];
+          
+          const spawnCount = Math.floor(4 + R * 15);
+          mpmSolver.spawnFromSurface(sx, sz, surfH, spawnCount, surfVel, R, heightAt);
         }
       }
     }
@@ -923,20 +966,11 @@ export default function SDFWaterScene({
 
   const handleClick = useCallback(
     (x: number, z: number) => {
+      // Click only creates wave energy in the heightfield.
+      // MLS-MPM particles spawn organically from wave energy detection, not from clicks.
       onClickOcean?.(x, z);
-
-      // Spawn MLS-MPM particles at click location
-      const elapsed = performance.now() / 1000;
-      const surfH = cpuOceanHeight(x, z, elapsed, paramsRef.current);
-      const [ux, uz] = cpuSurfaceMomentum(x, z, elapsed, paramsRef.current);
-      const umag = Math.sqrt(ux * ux + uz * uz);
-      const baseVel: [number, number, number] = umag > 0.5
-        ? [ux / umag * 3, 0, uz / umag * 3]
-        : [0, 0, 0];
-
-      mpmSolver.spawn(x, z, surfH, 60, baseVel, 2.5);
     },
-    [onClickOcean, mpmSolver]
+    [onClickOcean]
   );
 
   return (
