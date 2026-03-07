@@ -24,7 +24,7 @@ import * as THREE from "three";
 import { MLSMPMSolver, MAX_PARTICLES } from "@/lib/mlsMpmCPU";
 
 const MAX_SPLASHES = 8;
-const MAX_MPM_SHADER = 128; // Max particles queried per ray step
+const MAX_MPM_SHADER = 256; // Max particles queried per ray step
 
 // ─── Shader sources ───
 
