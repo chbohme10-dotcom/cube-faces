@@ -934,20 +934,11 @@ export default function SDFWaterScene({
 
   const handleClick = useCallback(
     (x: number, z: number) => {
+      // Click only creates wave energy in the heightfield.
+      // MLS-MPM particles spawn organically from wave energy detection, not from clicks.
       onClickOcean?.(x, z);
-
-      // Spawn MLS-MPM particles at click location
-      const elapsed = performance.now() / 1000;
-      const surfH = cpuOceanHeight(x, z, elapsed, paramsRef.current);
-      const [ux, uz] = cpuSurfaceMomentum(x, z, elapsed, paramsRef.current);
-      const umag = Math.sqrt(ux * ux + uz * uz);
-      const baseVel: [number, number, number] = umag > 0.5
-        ? [ux / umag * 3, 0, uz / umag * 3]
-        : [0, 0, 0];
-
-      mpmSolver.spawn(x, z, surfH, 60, baseVel, 2.5);
     },
-    [onClickOcean, mpmSolver]
+    [onClickOcean]
   );
 
   return (
