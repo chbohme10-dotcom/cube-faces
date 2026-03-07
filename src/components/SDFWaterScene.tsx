@@ -659,7 +659,10 @@ function cpuOceanHeight(x: number, z: number, time: number, params: SDFWaterPara
  * Compute rupture potential on CPU (mirrors shader rupturePotential).
  * Used for auto-spawning particles at high-energy wave points.
  */
-function cpuRupturePotential(x: number, z: number, time: number, params: SDFWaterParams): number {
+function cpuRupturePotential(
+  x: number, z: number, time: number, params: SDFWaterParams,
+  splashes?: SplashData[]
+): number {
   const s = params.waveScale;
   const ts = time * params.timeScale;
   const c = params.choppiness;
@@ -690,7 +693,36 @@ function cpuRupturePotential(x: number, z: number, time: number, params: SDFWate
   gx = g1[0] + g2[0] + g3[0]; gz = g1[1] + g2[1] + g3[1];
   const slope = Math.sqrt(gx * gx + gz * gz);
 
-  return folding * 0.4 + slope * 0.25;
+  // Vertical velocity from wave motion (finite difference proxy)
+  const gW = (px: number, pz: number, t: number, A: number, wl: number, dx: number, dz: number, spd: number, ph: number) => {
+    const k = TAU / wl;
+    return A * Math.cos(k * (dx * px + dz * pz) - k * spd * t + ph);
+  };
+  const h0 = gW(x, z, ts, 1.2*s, 60, 0.8, 0.6, 8, 0)
+           + gW(x, z, ts, 0.9*s, 42, -0.447, 0.894, 6.5, 1.5)
+           + gW(x, z, ts, 0.8*s, 80, 0, 1, 10, 4);
+  const h1 = gW(x, z, ts - 0.04, 1.2*s, 60, 0.8, 0.6, 8, 0)
+           + gW(x, z, ts - 0.04, 0.9*s, 42, -0.447, 0.894, 6.5, 1.5)
+           + gW(x, z, ts - 0.04, 0.8*s, 80, 0, 1, 10, 4);
+  const vUp = Math.max(0, (h0 - h1) / 0.04);
+
+  // Splash ripple energy contribution — makes click-created waves organically trigger MPM
+  let splashEnergy = 0;
+  if (splashes) {
+    for (const sp of splashes) {
+      const age = time - sp.time;
+      if (age < 0 || age > 10) continue;
+      const dist = Math.sqrt((x - sp.x) ** 2 + (z - sp.z) ** 2);
+      const speed = 8.0;
+      const ringDist = Math.abs(dist - speed * age);
+      // Energy concentrated at the expanding ring front
+      const energy = sp.amplitude * Math.exp(-age * 0.4) * Math.exp(-ringDist * 0.8)
+        * (1 - Math.exp(-age * 3)); // ramp up
+      splashEnergy += energy;
+    }
+  }
+
+  return folding * 0.35 + slope * 0.2 + vUp * 0.3 + Math.min(1.0, splashEnergy) * 0.5;
 }
 
 /**
