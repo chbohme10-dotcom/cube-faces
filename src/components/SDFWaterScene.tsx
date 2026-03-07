@@ -817,32 +817,43 @@ function OceanShader({
       mpmSolver.step(subDt, heightAt);
     }
 
-    // ═══ Auto-spawn from wave energy ═══
-    if (elapsed - lastAutoSpawn.current > autoSpawnCooldown && mpmSolver.count < MAX_PARTICLES - 50) {
+    // ═══ Auto-spawn from wave energy (the ONLY source of particles) ═══
+    // Per the docs: particles emerge organically from wave energy, not from clicks.
+    // The polarized heatmap detects high-energy crests and spawns surface-conforming sheets.
+    if (elapsed - lastAutoSpawn.current > autoSpawnCooldown && mpmSolver.count < MAX_PARTICLES - 80) {
       lastAutoSpawn.current = elapsed;
       
-      // Sample rupture potential at several points around the camera
-      const camX = camera.position.x;
-      const camZ = camera.position.z;
-      const sampleRadius = 15;
+      // Sample rupture potential across the visible ocean near origin
+      // Grid covers [-32,32] so sample within that
+      const sampleRange = 25;
       
-      for (let si = 0; si < 6; si++) {
-        const angle = (si / 6) * Math.PI * 2 + elapsed * 0.1;
-        const sx = camX + Math.cos(angle) * sampleRadius * (0.5 + Math.random() * 0.5);
-        const sz = camZ + Math.sin(angle) * sampleRadius * (0.5 + Math.random() * 0.5);
+      for (let si = 0; si < 12; si++) {
+        const angle = (si / 12) * Math.PI * 2 + elapsed * 0.15;
+        const radius = 3 + Math.random() * sampleRange;
+        const sx = Math.cos(angle) * radius;
+        const sz = Math.sin(angle) * radius;
         
         const R = cpuRupturePotential(sx, sz, elapsed, params);
         
-        if (R > 0.45) { // High energy threshold
+        if (R > 0.35) { // Rupture threshold
           const surfH = heightAt(sx, sz);
           const [ux, uz] = cpuSurfaceMomentum(sx, sz, elapsed, params);
           const umag = Math.sqrt(ux * ux + uz * uz);
-          const baseVel: [number, number, number] = umag > 0.5
-            ? [ux / umag * 2, 0, uz / umag * 2]
-            : [0, 0, 0];
           
-          const spawnCount = Math.floor(8 + R * 20);
-          mpmSolver.spawn(sx, sz, surfH, spawnCount, baseVel, R * 2);
+          // Vertical velocity estimate (finite difference)
+          const h0 = heightAt(sx, sz);
+          const h1 = cpuOceanHeight(sx, sz, elapsed - 0.03, params);
+          const vUp = Math.max(0, (h0 - h1) / 0.03);
+          
+          // Surface velocity: forward throw from wave momentum + upward from vertical motion
+          const surfVel: [number, number, number] = [
+            umag > 0.1 ? ux / umag * (1.0 + R) : 0,
+            vUp * (0.5 + R * 1.5),  // Controlled upward from actual surface velocity
+            umag > 0.1 ? uz / umag * (1.0 + R) : 0,
+          ];
+          
+          const spawnCount = Math.floor(4 + R * 15);
+          mpmSolver.spawnFromSurface(sx, sz, surfH, spawnCount, surfVel, R, heightAt);
         }
       }
     }
