@@ -865,7 +865,7 @@ function OceanShader({
         const sx = Math.cos(angle) * radius;
         const sz = Math.sin(angle) * radius;
         
-        const R = cpuRupturePotential(sx, sz, elapsed, params);
+        const R = cpuRupturePotential(sx, sz, elapsed, params, splashes);
         
         if (R > 0.35) { // Rupture threshold
           const surfH = heightAt(sx, sz);
