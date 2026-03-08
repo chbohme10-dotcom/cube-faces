@@ -1064,52 +1064,69 @@ function OceanShader({
     const dt = clock.getDelta();
 
     // ═══ MLS-MPM Step ═══
-    // Provide ocean height callback for reabsorption
-    const heightAt = (x: number, z: number) => cpuOceanHeight(x, z, elapsed, params);
-    
-    // Sub-step for stability (2 sub-steps)
+    // Include splash perturbations so reabsorption and launch logic see the same wave field the shader renders.
+    const heightAt = (x: number, z: number) => cpuOceanHeight(x, z, elapsed, params, splashes);
+
     const subDt = Math.min(dt, 0.016) / 2;
     for (let s = 0; s < 2; s++) {
       mpmSolver.step(subDt, heightAt);
     }
 
-    // ═══ Auto-spawn from wave energy (the ONLY source of particles) ═══
-    // Per the docs: particles emerge organically from wave energy, not from clicks.
-    // The polarized heatmap detects high-energy crests and spawns surface-conforming sheets.
-    if (elapsed - lastAutoSpawn.current > autoSpawnCooldown && mpmSolver.count < MAX_PARTICLES - 80) {
+    // ═══ Patch-based wave-driven emission ═══
+    // Click/drag only inject wave energy; detached MLS-MPM is emitted from high-severity crest patches.
+    if (elapsed - lastAutoSpawn.current > autoSpawnCooldown && mpmSolver.count < MAX_PARTICLES - 24) {
       lastAutoSpawn.current = elapsed;
-      
-      // Sample rupture potential across the visible ocean near origin
-      // Grid covers [-32,32] so sample within that
-      const sampleRange = 25;
-      
-      for (let si = 0; si < 12; si++) {
-        const angle = (si / 12) * Math.PI * 2 + elapsed * 0.15;
-        const radius = 3 + Math.random() * sampleRange;
-        const sx = Math.cos(angle) * radius;
-        const sz = Math.sin(angle) * radius;
-        
-        const R = cpuRupturePotential(sx, sz, elapsed, params, splashes);
-        
-        if (R > 0.35) { // Rupture threshold
-          const surfH = heightAt(sx, sz);
-          const [ux, uz] = cpuSurfaceMomentum(sx, sz, elapsed, params);
-          const umag = Math.sqrt(ux * ux + uz * uz);
-          
-          // Vertical velocity estimate (finite difference)
-          const h0 = heightAt(sx, sz);
-          const h1 = cpuOceanHeight(sx, sz, elapsed - 0.03, params);
-          const vUp = Math.max(0, (h0 - h1) / 0.03);
-          
-          // Surface velocity: forward throw from wave momentum + upward from vertical motion
-          const surfVel: [number, number, number] = [
-            umag > 0.1 ? ux / umag * (1.0 + R) : 0,
-            vUp * (0.5 + R * 1.5),  // Controlled upward from actual surface velocity
-            umag > 0.1 ? uz / umag * (1.0 + R) : 0,
-          ];
-          
-          const spawnCount = Math.floor(4 + R * 15);
-          mpmSolver.spawnFromSurface(sx, sz, surfH, spawnCount, surfVel, R, heightAt);
+
+      const patches = gatherRupturePatches(elapsed, params, splashes);
+      const reservoir = reservoirRef.current;
+
+      for (const patch of patches) {
+        const prevM = reservoir.get(patch.key) ?? 0.55;
+        const chargedM = Math.min(1.6, prevM + autoSpawnCooldown * 0.35 + patch.coherence * 0.06);
+
+        if (!(patch.severity > ruptureOn && chargedM > 0.14)) {
+          const recovered = patch.severity < ruptureOff ? Math.min(1.6, chargedM + 0.05) : chargedM;
+          reservoir.set(patch.key, recovered);
+          continue;
+        }
+
+        const umag = Math.hypot(patch.ux, patch.uz);
+        const dirX = umag > 1e-4 ? patch.ux / umag : 0;
+        const dirZ = umag > 1e-4 ? patch.uz / umag : 0;
+
+        const forwardThrow = 0.7 + Math.min(2.2, umag * 0.25) + patch.severity * 0.9;
+        const lift = 0.45 + patch.vUp * 0.35 + patch.severity * (0.7 + patch.coherence * 0.8);
+
+        const surfaceVel: [number, number, number] = [
+          dirX * forwardThrow,
+          lift,
+          dirZ * forwardThrow,
+        ];
+
+        const spawnCount = Math.max(
+          2,
+          Math.min(12, Math.floor(2 + patch.severity * 6 + patch.coherence * 3 + chargedM * 2))
+        );
+
+        mpmSolver.spawnFromSurface(
+          patch.x,
+          patch.z,
+          patch.surfaceH,
+          spawnCount,
+          surfaceVel,
+          Math.min(1.2, 0.3 + patch.severity * 0.9),
+          heightAt
+        );
+
+        const drain = spawnCount * (0.018 + patch.severity * 0.012);
+        reservoir.set(patch.key, Math.max(0.04, chargedM - drain));
+
+        if (mpmSolver.count >= MAX_PARTICLES - 16) break;
+      }
+
+      if (reservoir.size > 400) {
+        for (const [key, value] of reservoir.entries()) {
+          if (value < 0.06) reservoir.delete(key);
         }
       }
     }
