@@ -922,17 +922,70 @@ function gatherRupturePatches(
 
 // ─── Click Plane ───
 
-function ClickPlane({ onClickOcean }: { onClickOcean: (x: number, z: number) => void }) {
-  const handleClick = useCallback(
-    (e: ThreeEvent<MouseEvent>) => {
-      e.stopPropagation();
-      if (e.point) onClickOcean(e.point.x, e.point.z);
+function ClickPlane({ onWaveInput }: { onWaveInput: (x: number, z: number, intensity: number) => void }) {
+  const draggingRef = useRef(false);
+  const lastPointRef = useRef<THREE.Vector3 | null>(null);
+  const lastEmitRef = useRef(0);
+
+  const emit = useCallback(
+    (point: THREE.Vector3, intensity: number) => {
+      onWaveInput(point.x, point.z, intensity);
     },
-    [onClickOcean]
+    [onWaveInput]
   );
 
+  const handlePointerDown = useCallback(
+    (e: ThreeEvent<PointerEvent>) => {
+      if (e.button !== 0 || !e.point) return;
+      e.stopPropagation();
+      draggingRef.current = true;
+      lastPointRef.current = e.point.clone();
+      lastEmitRef.current = e.timeStamp;
+      emit(e.point, 1.0);
+    },
+    [emit]
+  );
+
+  const handlePointerMove = useCallback(
+    (e: ThreeEvent<PointerEvent>) => {
+      if (!draggingRef.current || !e.point) return;
+      e.stopPropagation();
+
+      const last = lastPointRef.current;
+      if (!last) {
+        lastPointRef.current = e.point.clone();
+        lastEmitRef.current = e.timeStamp;
+        return;
+      }
+
+      const dt = Math.max(0.001, (e.timeStamp - lastEmitRef.current) / 1000);
+      const dist = last.distanceTo(e.point);
+      if (dist < 0.3 && dt < 0.05) return;
+
+      const speed = dist / dt;
+      const intensity = Math.min(2.2, Math.max(0.25, speed * 0.18));
+      emit(e.point, intensity);
+      last.copy(e.point);
+      lastEmitRef.current = e.timeStamp;
+    },
+    [emit]
+  );
+
+  const endDrag = useCallback(() => {
+    draggingRef.current = false;
+    lastPointRef.current = null;
+  }, []);
+
   return (
-    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0, 0]} onClick={handleClick} visible={false}>
+    <mesh
+      rotation={[-Math.PI / 2, 0, 0]}
+      position={[0, 0, 0]}
+      visible={false}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={endDrag}
+      onPointerLeave={endDrag}
+    >
       <planeGeometry args={[500, 500]} />
       <meshBasicMaterial />
     </mesh>
