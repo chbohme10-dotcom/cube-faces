@@ -1025,9 +1025,12 @@ function OceanShader({
     return tex;
   }, []);
 
-  // Auto-spawn tracking
+  // Auto-spawn tracking + local detachable mass memory (reservoir M)
   const lastAutoSpawn = useRef(0);
-  const autoSpawnCooldown = 0.25; // seconds between auto-spawn checks — frequent for organic feel
+  const autoSpawnCooldown = 0.08;
+  const ruptureOn = 0.34;
+  const ruptureOff = 0.24;
+  const reservoirRef = useRef<Map<string, number>>(new Map());
 
   const uniforms = useMemo(
     () => ({
