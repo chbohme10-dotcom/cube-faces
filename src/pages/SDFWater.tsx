@@ -136,7 +136,7 @@ export default function SDFWater() {
       {/* Click hint */}
       <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
         <p className="text-[10px] font-mono text-muted-foreground/50 bg-card/20 backdrop-blur-sm px-3 py-1 rounded-full">
-          Click the water to create splashes
+          Click or drag on the water to inject wave energy
         </p>
       </div>
 
