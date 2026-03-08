@@ -47,17 +47,19 @@ export default function SDFWater() {
     []
   );
 
-  const handleClickOcean = useCallback((x: number, z: number) => {
+  const handleWaveInput = useCallback((x: number, z: number, intensity = 1) => {
     const elapsed = performance.now() / 1000 - startTime.current;
+    const amplitude = Math.min(1.8, Math.max(0.35, 0.45 + intensity * 0.45));
+
     const newSplash: SplashData = {
       x,
       z,
       time: elapsed,
-      amplitude: 2.5,
+      amplitude,
     };
+
     setSplashes((prev) => {
       const updated = [...prev, newSplash];
-      // Keep only recent splashes
       return updated.slice(-8);
     });
   }, []);
@@ -70,7 +72,7 @@ export default function SDFWater() {
           params={params}
           splashes={splashes}
           vizMode={vizMode}
-          onClickOcean={handleClickOcean}
+          onWaveInput={handleWaveInput}
         />
       </div>
 
