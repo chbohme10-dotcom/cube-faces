@@ -47,17 +47,19 @@ export default function SDFWater() {
     []
   );
 
-  const handleClickOcean = useCallback((x: number, z: number) => {
+  const handleWaveInput = useCallback((x: number, z: number, intensity = 1) => {
     const elapsed = performance.now() / 1000 - startTime.current;
+    const amplitude = Math.min(1.8, Math.max(0.35, 0.45 + intensity * 0.45));
+
     const newSplash: SplashData = {
       x,
       z,
       time: elapsed,
-      amplitude: 2.5,
+      amplitude,
     };
+
     setSplashes((prev) => {
       const updated = [...prev, newSplash];
-      // Keep only recent splashes
       return updated.slice(-8);
     });
   }, []);
@@ -70,7 +72,7 @@ export default function SDFWater() {
           params={params}
           splashes={splashes}
           vizMode={vizMode}
-          onClickOcean={handleClickOcean}
+          onWaveInput={handleWaveInput}
         />
       </div>
 
@@ -134,7 +136,7 @@ export default function SDFWater() {
       {/* Click hint */}
       <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
         <p className="text-[10px] font-mono text-muted-foreground/50 bg-card/20 backdrop-blur-sm px-3 py-1 rounded-full">
-          Click the water to create splashes
+          Click or drag on the water to inject wave energy
         </p>
       </div>
 
@@ -175,7 +177,7 @@ export default function SDFWater() {
             Clear Splashes
           </button>
           <p className="mt-3 text-[9px] font-mono text-muted-foreground/50 leading-relaxed">
-            Drag to orbit · Scroll to zoom · Click water to splash · Dive below for underwater view
+            Drag to orbit · Scroll to zoom · Click/drag water to inject wave energy · Dive below for underwater view
           </p>
         </div>
       )}

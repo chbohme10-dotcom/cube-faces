@@ -630,10 +630,57 @@ const DEFAULT_PARAMS: SDFWaterParams = {
 };
 
 /**
- * Evaluate Gerstner height on CPU (mirrors shader oceanHeightFull).
- * Used by MLS-MPM solver for reabsorption checks.
+ * Helpers for intent-field computation.
  */
-function cpuOceanHeight(x: number, z: number, time: number, params: SDFWaterParams): number {
+const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+
+function cpuSplashHeight(x: number, z: number, time: number, splashes: SplashData[] = []): number {
+  let h = 0;
+
+  for (const sp of splashes) {
+    const age = time - sp.time;
+    if (age < 0 || age > 12) continue;
+
+    const dx = x - sp.x;
+    const dz = z - sp.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    const decay = Math.exp(-age * 0.35) * Math.exp(-dist * 0.015);
+    const speed = 8.0;
+    const phase = dist - speed * age;
+    const ripple = Math.sin(phase * 0.8) + Math.sin(phase * 1.6 + 0.5) * 0.4 + Math.sin(phase * 3.2 + 1.0) * 0.15;
+    const envelope =
+      (1 - clamp01((dist - (speed * age - 1.0)) / 3.0)) *
+      clamp01(age / 0.5);
+
+    h += sp.amplitude * ripple * decay * envelope;
+    h += -sp.amplitude * 1.5 * Math.exp(-age * 2.5) * Math.exp(-(dist * dist) / (sp.amplitude * sp.amplitude * 3.0));
+  }
+
+  return h;
+}
+
+function cpuSplashGradient(x: number, z: number, time: number, splashes: SplashData[] = []): [number, number] {
+  const eps = 0.3;
+  const gx =
+    (cpuSplashHeight(x + eps, z, time, splashes) - cpuSplashHeight(x - eps, z, time, splashes)) /
+    (2 * eps);
+  const gz =
+    (cpuSplashHeight(x, z + eps, time, splashes) - cpuSplashHeight(x, z - eps, time, splashes)) /
+    (2 * eps);
+  return [gx, gz];
+}
+
+/**
+ * Evaluate Gerstner height on CPU (mirrors shader oceanHeightFull) with splash injection.
+ * Used by MLS-MPM solver for reabsorption checks and surface intent fields.
+ */
+function cpuOceanHeight(
+  x: number,
+  z: number,
+  time: number,
+  params: SDFWaterParams,
+  splashes: SplashData[] = []
+): number {
   const s = params.waveScale;
   const ts = time * params.timeScale;
   const TAU = Math.PI * 2;
@@ -652,16 +699,90 @@ function cpuOceanHeight(x: number, z: number, time: number, params: SDFWaterPara
   h += gW(x, z, ts, 0.3 * s, 13, 0.95, -0.3, 3.5, 1.8);
   h += gW(x, z, ts, 0.25 * s, 8.5, 0.6, -0.8, 3.2, 3.3);
   h += gW(x, z, ts, 0.15 * s, 5.5, -0.7, 0.7, 2.5, 5.2);
+  h += cpuSplashHeight(x, z, time, splashes);
   return h;
 }
 
 /**
- * Compute rupture potential on CPU (mirrors shader rupturePotential).
- * Used for auto-spawning particles at high-energy wave points.
+ * CPU surface momentum direction for particle launch orientation.
+ */
+function cpuSurfaceMomentum(
+  x: number,
+  z: number,
+  time: number,
+  params: SDFWaterParams,
+  splashes: SplashData[] = []
+): [number, number] {
+  const s = params.waveScale;
+  const ts = time * params.timeScale;
+  const TAU = Math.PI * 2;
+
+  const gG = (px: number, pz: number, t: number, A: number, wl: number, dx: number, dz: number, spd: number, ph: number) => {
+    const k = TAU / wl;
+    const val = -A * k * Math.sin(k * (dx * px + dz * pz) - k * spd * t + ph);
+    return [val * dx * spd, val * dz * spd] as [number, number];
+  };
+
+  let ux = 0;
+  let uz = 0;
+
+  const components = [
+    { A: 1.2 * s, wl: 60, dx: 0.8, dz: 0.6, spd: 8, ph: 0 },
+    { A: 0.9 * s, wl: 42, dx: -0.447, dz: 0.894, spd: 6.5, ph: 1.5 },
+    { A: 0.6 * s, wl: 26, dx: 0.3, dz: -0.95, spd: 5.2, ph: 0.7 },
+  ];
+
+  for (const comp of components) {
+    const g = gG(x, z, ts, comp.A, comp.wl, comp.dx, comp.dz, comp.spd, comp.ph);
+    ux += g[0];
+    uz += g[1];
+  }
+
+  const splashGrad = cpuSplashGradient(x, z, time, splashes);
+  ux += splashGrad[0] * 6.5;
+  uz += splashGrad[1] * 6.5;
+
+  return [ux, uz];
+}
+
+function cpuCoherence(
+  x: number,
+  z: number,
+  time: number,
+  params: SDFWaterParams,
+  splashes: SplashData[] = []
+): number {
+  const eps = 0.8;
+  const h0 = cpuOceanHeight(x, z, time, params, splashes);
+  const hxp = cpuOceanHeight(x + eps, z, time, params, splashes);
+  const hxn = cpuOceanHeight(x - eps, z, time, params, splashes);
+  const hzp = cpuOceanHeight(x, z + eps, time, params, splashes);
+  const hzn = cpuOceanHeight(x, z - eps, time, params, splashes);
+
+  const laplacian = Math.abs(hxp + hxn + hzp + hzn - 4 * h0) / (eps * eps);
+  const gx = (hxp - hxn) / (2 * eps);
+  const gz = (hzp - hzn) / (2 * eps);
+  const slope = Math.hypot(gx, gz);
+
+  const [ux, uz] = cpuSurfaceMomentum(x, z, time, params, splashes);
+  const umag = Math.hypot(ux, uz);
+
+  const crestness = clamp01(laplacian * 0.22);
+  const ridge = clamp01((slope - 0.05) * 2.0);
+  const directionality = clamp01(umag * 0.08);
+
+  return clamp01(crestness * 0.5 + ridge * 0.3 + directionality * 0.2);
+}
+
+/**
+ * Compute rupture potential on CPU (mirrors shader intent philosophy).
  */
 function cpuRupturePotential(
-  x: number, z: number, time: number, params: SDFWaterParams,
-  splashes?: SplashData[]
+  x: number,
+  z: number,
+  time: number,
+  params: SDFWaterParams,
+  splashes: SplashData[] = []
 ): number {
   const s = params.waveScale;
   const ts = time * params.timeScale;
@@ -680,91 +801,191 @@ function cpuRupturePotential(
   j -= gJ(x, z, ts, 0.4 * s, 16, -0.9, -0.44, 4, 2.1, 0.45 * c);
   const folding = j < 0 ? Math.min(1, -j / 0.4) : 0;
 
-  const gG = (px: number, pz: number, t: number, A: number, wl: number, dx: number, dz: number, spd: number, ph: number) => {
-    const k = TAU / wl;
-    const val = -A * k * Math.sin(k * (dx * px + dz * pz) - k * spd * t + ph);
-    return [val * dx, val * dz] as [number, number];
-  };
+  const eps = 0.6;
+  const gx =
+    (cpuOceanHeight(x + eps, z, time, params, splashes) -
+      cpuOceanHeight(x - eps, z, time, params, splashes)) /
+    (2 * eps);
+  const gz =
+    (cpuOceanHeight(x, z + eps, time, params, splashes) -
+      cpuOceanHeight(x, z - eps, time, params, splashes)) /
+    (2 * eps);
+  const slope = Math.hypot(gx, gz);
 
-  let gx = 0, gz = 0;
-  const g1 = gG(x, z, ts, 1.2 * s, 60, 0.8, 0.6, 8, 0);
-  const g2 = gG(x, z, ts, 0.9 * s, 42, -0.447, 0.894, 6.5, 1.5);
-  const g3 = gG(x, z, ts, 0.6 * s, 26, 0.3, -0.95, 5.2, 0.7);
-  gx = g1[0] + g2[0] + g3[0]; gz = g1[1] + g2[1] + g3[1];
-  const slope = Math.sqrt(gx * gx + gz * gz);
-
-  // Vertical velocity from wave motion (finite difference proxy)
-  const gW = (px: number, pz: number, t: number, A: number, wl: number, dx: number, dz: number, spd: number, ph: number) => {
-    const k = TAU / wl;
-    return A * Math.cos(k * (dx * px + dz * pz) - k * spd * t + ph);
-  };
-  const h0 = gW(x, z, ts, 1.2*s, 60, 0.8, 0.6, 8, 0)
-           + gW(x, z, ts, 0.9*s, 42, -0.447, 0.894, 6.5, 1.5)
-           + gW(x, z, ts, 0.8*s, 80, 0, 1, 10, 4);
-  const h1 = gW(x, z, ts - 0.04, 1.2*s, 60, 0.8, 0.6, 8, 0)
-           + gW(x, z, ts - 0.04, 0.9*s, 42, -0.447, 0.894, 6.5, 1.5)
-           + gW(x, z, ts - 0.04, 0.8*s, 80, 0, 1, 10, 4);
+  const h0 = cpuOceanHeight(x, z, time, params, splashes);
+  const h1 = cpuOceanHeight(x, z, time - 0.04, params, splashes);
   const vUp = Math.max(0, (h0 - h1) / 0.04);
 
-  // Splash ripple energy contribution — makes click-created waves organically trigger MPM
-  let splashEnergy = 0;
-  if (splashes) {
-    for (const sp of splashes) {
-      const age = time - sp.time;
-      if (age < 0 || age > 10) continue;
-      const dist = Math.sqrt((x - sp.x) ** 2 + (z - sp.z) ** 2);
-      const speed = 8.0;
-      const ringDist = Math.abs(dist - speed * age);
-      // Energy concentrated at the expanding ring front
-      const energy = sp.amplitude * Math.exp(-age * 0.4) * Math.exp(-ringDist * 0.8)
-        * (1 - Math.exp(-age * 3)); // ramp up
-      splashEnergy += energy;
+  const [ux, uz] = cpuSurfaceMomentum(x, z, time, params, splashes);
+  const umag = Math.hypot(ux, uz);
+  const coherence = cpuCoherence(x, z, time, params, splashes);
+
+  let splashMemory = 0;
+  for (const sp of splashes) {
+    const age = time - sp.time;
+    if (age < 0 || age > 3.2) continue;
+    const dist = Math.hypot(x - sp.x, z - sp.z);
+    const ring = Math.abs(dist - 8 * age);
+    splashMemory += sp.amplitude * Math.exp(-age * 0.55) * Math.exp(-ring * 0.65);
+  }
+
+  const Rraw =
+    folding * 0.32 +
+    slope * 0.16 +
+    vUp * 0.2 +
+    Math.min(1, umag * 0.08) * 0.15 +
+    coherence * 0.12 +
+    Math.min(1.1, splashMemory * 0.45) * 0.22;
+
+  return clamp01(Rraw);
+}
+
+interface RupturePatch {
+  key: string;
+  x: number;
+  z: number;
+  surfaceH: number;
+  ux: number;
+  uz: number;
+  vUp: number;
+  severity: number;
+  coherence: number;
+  score: number;
+}
+
+function gatherRupturePatches(
+  time: number,
+  params: SDFWaterParams,
+  splashes: SplashData[]
+): RupturePatch[] {
+  const patches = new Map<string, RupturePatch>();
+  const keyFor = (x: number, z: number) => `${Math.round(x / 2)},${Math.round(z / 2)}`;
+
+  const addCandidate = (x: number, z: number, bias = 0) => {
+    if (x < -30 || x > 30 || z < -30 || z > 30) return;
+
+    const R = cpuRupturePotential(x, z, time, params, splashes);
+    if (R < 0.22) return;
+
+    const coherence = cpuCoherence(x, z, time, params, splashes);
+    const [ux, uz] = cpuSurfaceMomentum(x, z, time, params, splashes);
+    const umag = Math.hypot(ux, uz);
+    const surfaceH = cpuOceanHeight(x, z, time, params, splashes);
+    const prevH = cpuOceanHeight(x, z, time - 0.03, params, splashes);
+    const vUp = Math.max(0, (surfaceH - prevH) / 0.03);
+
+    const severity = clamp01(R * 0.8 + coherence * 0.15 + Math.min(1, umag * 0.08) * 0.2 + bias * 0.2);
+    const score = severity * 0.55 + coherence * 0.25 + Math.min(1, umag * 0.08) * 0.2;
+
+    const key = keyFor(x, z);
+    const existing = patches.get(key);
+    if (!existing || score > existing.score) {
+      patches.set(key, {
+        key,
+        x,
+        z,
+        surfaceH,
+        ux,
+        uz,
+        vUp,
+        severity,
+        coherence,
+        score,
+      });
+    }
+  };
+
+  for (const sp of splashes) {
+    const age = time - sp.time;
+    if (age < 0.06 || age > 3.0) continue;
+
+    const radius = 8.0 * age;
+    const segments = 12;
+    const bias = clamp01(sp.amplitude / 1.5);
+
+    for (let i = 0; i < segments; i++) {
+      const a = (i / segments) * Math.PI * 2;
+      addCandidate(sp.x + Math.cos(a) * radius, sp.z + Math.sin(a) * radius, bias);
     }
   }
 
-  return folding * 0.35 + slope * 0.2 + vUp * 0.3 + Math.min(1.0, splashEnergy) * 0.5;
-}
-
-/**
- * CPU surface momentum direction for particle launch orientation.
- */
-function cpuSurfaceMomentum(x: number, z: number, time: number, params: SDFWaterParams): [number, number] {
-  const s = params.waveScale;
-  const ts = time * params.timeScale;
-  const TAU = Math.PI * 2;
-
-  const gG = (px: number, pz: number, t: number, A: number, wl: number, dx: number, dz: number, spd: number, ph: number) => {
-    const k = TAU / wl;
-    const val = -A * k * Math.sin(k * (dx * px + dz * pz) - k * spd * t + ph);
-    return [val * dx * spd, val * dz * spd] as [number, number];
-  };
-
-  let ux = 0, uz = 0;
-  const pairs: [number, number, number, number, number][] = [
-    [1.2 * s, 60, 0.8, 0.6, 8],
-    [0.9 * s, 42, -0.447, 0.894, 6.5],
-    [0.6 * s, 26, 0.3, -0.95, 5.2],
-  ];
-  for (const [A, wl, dx, dz, spd] of pairs) {
-    const g = gG(x, z, ts, A, wl, dx, dz, spd, 0);
-    ux += g[0]; uz += g[1];
+  for (let gx = -18; gx <= 18; gx += 9) {
+    for (let gz = -18; gz <= 18; gz += 9) {
+      const driftX = Math.sin(time * 0.35 + gz * 0.15) * 1.2;
+      const driftZ = Math.cos(time * 0.3 + gx * 0.12) * 1.2;
+      addCandidate(gx + driftX, gz + driftZ, 0);
+    }
   }
-  return [ux, uz];
+
+  return [...patches.values()].sort((a, b) => b.score - a.score).slice(0, 8);
 }
 
 // ─── Click Plane ───
 
-function ClickPlane({ onClickOcean }: { onClickOcean: (x: number, z: number) => void }) {
-  const handleClick = useCallback(
-    (e: ThreeEvent<MouseEvent>) => {
-      e.stopPropagation();
-      if (e.point) onClickOcean(e.point.x, e.point.z);
+function ClickPlane({ onWaveInput }: { onWaveInput: (x: number, z: number, intensity: number) => void }) {
+  const draggingRef = useRef(false);
+  const lastPointRef = useRef<THREE.Vector3 | null>(null);
+  const lastEmitRef = useRef(0);
+
+  const emit = useCallback(
+    (point: THREE.Vector3, intensity: number) => {
+      onWaveInput(point.x, point.z, intensity);
     },
-    [onClickOcean]
+    [onWaveInput]
   );
 
+  const handlePointerDown = useCallback(
+    (e: ThreeEvent<PointerEvent>) => {
+      if (e.button !== 0 || !e.point) return;
+      e.stopPropagation();
+      draggingRef.current = true;
+      lastPointRef.current = e.point.clone();
+      lastEmitRef.current = e.timeStamp;
+      emit(e.point, 1.0);
+    },
+    [emit]
+  );
+
+  const handlePointerMove = useCallback(
+    (e: ThreeEvent<PointerEvent>) => {
+      if (!draggingRef.current || !e.point) return;
+      e.stopPropagation();
+
+      const last = lastPointRef.current;
+      if (!last) {
+        lastPointRef.current = e.point.clone();
+        lastEmitRef.current = e.timeStamp;
+        return;
+      }
+
+      const dt = Math.max(0.001, (e.timeStamp - lastEmitRef.current) / 1000);
+      const dist = last.distanceTo(e.point);
+      if (dist < 0.3 && dt < 0.05) return;
+
+      const speed = dist / dt;
+      const intensity = Math.min(2.2, Math.max(0.25, speed * 0.18));
+      emit(e.point, intensity);
+      last.copy(e.point);
+      lastEmitRef.current = e.timeStamp;
+    },
+    [emit]
+  );
+
+  const endDrag = useCallback(() => {
+    draggingRef.current = false;
+    lastPointRef.current = null;
+  }, []);
+
   return (
-    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0, 0]} onClick={handleClick} visible={false}>
+    <mesh
+      rotation={[-Math.PI / 2, 0, 0]}
+      position={[0, 0, 0]}
+      visible={false}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={endDrag}
+      onPointerLeave={endDrag}
+    >
       <planeGeometry args={[500, 500]} />
       <meshBasicMaterial />
     </mesh>
@@ -804,9 +1025,12 @@ function OceanShader({
     return tex;
   }, []);
 
-  // Auto-spawn tracking
+  // Auto-spawn tracking + local detachable mass memory (reservoir M)
   const lastAutoSpawn = useRef(0);
-  const autoSpawnCooldown = 0.25; // seconds between auto-spawn checks — frequent for organic feel
+  const autoSpawnCooldown = 0.08;
+  const ruptureOn = 0.34;
+  const ruptureOff = 0.24;
+  const reservoirRef = useRef<Map<string, number>>(new Map());
 
   const uniforms = useMemo(
     () => ({
@@ -840,52 +1064,69 @@ function OceanShader({
     const dt = clock.getDelta();
 
     // ═══ MLS-MPM Step ═══
-    // Provide ocean height callback for reabsorption
-    const heightAt = (x: number, z: number) => cpuOceanHeight(x, z, elapsed, params);
-    
-    // Sub-step for stability (2 sub-steps)
+    // Include splash perturbations so reabsorption and launch logic see the same wave field the shader renders.
+    const heightAt = (x: number, z: number) => cpuOceanHeight(x, z, elapsed, params, splashes);
+
     const subDt = Math.min(dt, 0.016) / 2;
     for (let s = 0; s < 2; s++) {
       mpmSolver.step(subDt, heightAt);
     }
 
-    // ═══ Auto-spawn from wave energy (the ONLY source of particles) ═══
-    // Per the docs: particles emerge organically from wave energy, not from clicks.
-    // The polarized heatmap detects high-energy crests and spawns surface-conforming sheets.
-    if (elapsed - lastAutoSpawn.current > autoSpawnCooldown && mpmSolver.count < MAX_PARTICLES - 80) {
+    // ═══ Patch-based wave-driven emission ═══
+    // Click/drag only inject wave energy; detached MLS-MPM is emitted from high-severity crest patches.
+    if (elapsed - lastAutoSpawn.current > autoSpawnCooldown && mpmSolver.count < MAX_PARTICLES - 24) {
       lastAutoSpawn.current = elapsed;
-      
-      // Sample rupture potential across the visible ocean near origin
-      // Grid covers [-32,32] so sample within that
-      const sampleRange = 25;
-      
-      for (let si = 0; si < 12; si++) {
-        const angle = (si / 12) * Math.PI * 2 + elapsed * 0.15;
-        const radius = 3 + Math.random() * sampleRange;
-        const sx = Math.cos(angle) * radius;
-        const sz = Math.sin(angle) * radius;
-        
-        const R = cpuRupturePotential(sx, sz, elapsed, params, splashes);
-        
-        if (R > 0.35) { // Rupture threshold
-          const surfH = heightAt(sx, sz);
-          const [ux, uz] = cpuSurfaceMomentum(sx, sz, elapsed, params);
-          const umag = Math.sqrt(ux * ux + uz * uz);
-          
-          // Vertical velocity estimate (finite difference)
-          const h0 = heightAt(sx, sz);
-          const h1 = cpuOceanHeight(sx, sz, elapsed - 0.03, params);
-          const vUp = Math.max(0, (h0 - h1) / 0.03);
-          
-          // Surface velocity: forward throw from wave momentum + upward from vertical motion
-          const surfVel: [number, number, number] = [
-            umag > 0.1 ? ux / umag * (1.0 + R) : 0,
-            vUp * (0.5 + R * 1.5),  // Controlled upward from actual surface velocity
-            umag > 0.1 ? uz / umag * (1.0 + R) : 0,
-          ];
-          
-          const spawnCount = Math.floor(4 + R * 15);
-          mpmSolver.spawnFromSurface(sx, sz, surfH, spawnCount, surfVel, R, heightAt);
+
+      const patches = gatherRupturePatches(elapsed, params, splashes);
+      const reservoir = reservoirRef.current;
+
+      for (const patch of patches) {
+        const prevM = reservoir.get(patch.key) ?? 0.55;
+        const chargedM = Math.min(1.6, prevM + autoSpawnCooldown * 0.35 + patch.coherence * 0.06);
+
+        if (!(patch.severity > ruptureOn && chargedM > 0.14)) {
+          const recovered = patch.severity < ruptureOff ? Math.min(1.6, chargedM + 0.05) : chargedM;
+          reservoir.set(patch.key, recovered);
+          continue;
+        }
+
+        const umag = Math.hypot(patch.ux, patch.uz);
+        const dirX = umag > 1e-4 ? patch.ux / umag : 0;
+        const dirZ = umag > 1e-4 ? patch.uz / umag : 0;
+
+        const forwardThrow = 0.7 + Math.min(2.2, umag * 0.25) + patch.severity * 0.9;
+        const lift = 0.45 + patch.vUp * 0.35 + patch.severity * (0.7 + patch.coherence * 0.8);
+
+        const surfaceVel: [number, number, number] = [
+          dirX * forwardThrow,
+          lift,
+          dirZ * forwardThrow,
+        ];
+
+        const spawnCount = Math.max(
+          2,
+          Math.min(12, Math.floor(2 + patch.severity * 6 + patch.coherence * 3 + chargedM * 2))
+        );
+
+        mpmSolver.spawnFromSurface(
+          patch.x,
+          patch.z,
+          patch.surfaceH,
+          spawnCount,
+          surfaceVel,
+          Math.min(1.2, 0.3 + patch.severity * 0.9),
+          heightAt
+        );
+
+        const drain = spawnCount * (0.018 + patch.severity * 0.012);
+        reservoir.set(patch.key, Math.max(0.04, chargedM - drain));
+
+        if (mpmSolver.count >= MAX_PARTICLES - 16) break;
+      }
+
+      if (reservoir.size > 400) {
+        for (const [key, value] of reservoir.entries()) {
+          if (value < 0.06) reservoir.delete(key);
         }
       }
     }
@@ -952,25 +1193,24 @@ export default function SDFWaterScene({
   params = DEFAULT_PARAMS,
   splashes = [],
   vizMode = 0,
-  onClickOcean,
+  onWaveInput,
 }: {
   params?: SDFWaterParams;
   splashes?: SplashData[];
   vizMode?: number;
-  onClickOcean?: (x: number, z: number) => void;
+  onWaveInput?: (x: number, z: number, intensity: number) => void;
 }) {
   // Single MLS-MPM solver instance, persists across renders
   const mpmSolver = useMemo(() => new MLSMPMSolver(), []);
   const paramsRef = useRef(params);
   paramsRef.current = params;
 
-  const handleClick = useCallback(
-    (x: number, z: number) => {
-      // Click only creates wave energy in the heightfield.
-      // MLS-MPM particles spawn organically from wave energy detection, not from clicks.
-      onClickOcean?.(x, z);
+  const handleWaveInput = useCallback(
+    (x: number, z: number, intensity = 1) => {
+      // User input injects wave energy into the 2.5D sheet; detached fluid remains wave-driven.
+      onWaveInput?.(x, z, intensity);
     },
-    [onClickOcean]
+    [onWaveInput]
   );
 
   return (
@@ -985,7 +1225,7 @@ export default function SDFWaterScene({
         vizMode={vizMode}
         mpmSolver={mpmSolver}
       />
-      <ClickPlane onClickOcean={handleClick} />
+      <ClickPlane onWaveInput={handleWaveInput} />
       <OrbitControls
         autoRotate
         autoRotateSpeed={0.15}
