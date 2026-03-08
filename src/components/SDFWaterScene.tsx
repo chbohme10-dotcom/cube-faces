@@ -1193,25 +1193,24 @@ export default function SDFWaterScene({
   params = DEFAULT_PARAMS,
   splashes = [],
   vizMode = 0,
-  onClickOcean,
+  onWaveInput,
 }: {
   params?: SDFWaterParams;
   splashes?: SplashData[];
   vizMode?: number;
-  onClickOcean?: (x: number, z: number) => void;
+  onWaveInput?: (x: number, z: number, intensity: number) => void;
 }) {
   // Single MLS-MPM solver instance, persists across renders
   const mpmSolver = useMemo(() => new MLSMPMSolver(), []);
   const paramsRef = useRef(params);
   paramsRef.current = params;
 
-  const handleClick = useCallback(
-    (x: number, z: number) => {
-      // Click only creates wave energy in the heightfield.
-      // MLS-MPM particles spawn organically from wave energy detection, not from clicks.
-      onClickOcean?.(x, z);
+  const handleWaveInput = useCallback(
+    (x: number, z: number, intensity = 1) => {
+      // User input injects wave energy into the 2.5D sheet; detached fluid remains wave-driven.
+      onWaveInput?.(x, z, intensity);
     },
-    [onClickOcean]
+    [onWaveInput]
   );
 
   return (
@@ -1226,7 +1225,7 @@ export default function SDFWaterScene({
         vizMode={vizMode}
         mpmSolver={mpmSolver}
       />
-      <ClickPlane onClickOcean={handleClick} />
+      <ClickPlane onWaveInput={handleWaveInput} />
       <OrbitControls
         autoRotate
         autoRotateSpeed={0.15}
