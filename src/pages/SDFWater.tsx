@@ -177,7 +177,7 @@ export default function SDFWater() {
             Clear Splashes
           </button>
           <p className="mt-3 text-[9px] font-mono text-muted-foreground/50 leading-relaxed">
-            Drag to orbit · Scroll to zoom · Click water to splash · Dive below for underwater view
+            Drag to orbit · Scroll to zoom · Click/drag water to inject wave energy · Dive below for underwater view
           </p>
         </div>
       )}
